@@ -11,10 +11,12 @@ import os
 import shutil
 import asyncio
 import threading
+import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from PIL import Image
 
 from telegram import Update
+from telegram.error import NetworkError, TimedOut, Conflict, TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -583,6 +585,22 @@ async def scheduled_monday_gazette_loop(app):
 async def post_init(application: Application) -> None:
     """Безопасный запуск фоновых задач после инициализации бота."""
     asyncio.create_task(scheduled_monday_gazette_loop(application))
+
+# ==========================
+# Глобальный обработчик сетевых и непредвиденных ошибок
+# ==========================
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Перехватывает сетевые сбои поллинга и исключает спам полным трейсбеком в логи."""
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)):
+        # Краткий лог обычных микро-обрывов интернета на хостинге Render
+        print(f"[Сетевое предупреждение]: Кратковременный сбой связи с серверами Telegram: {err}")
+        return
+    if isinstance(err, Conflict):
+        print("[Критическая ошибка]: Запущено две копии бота одновременно с одним токеном!")
+        return
+    print(f"[Непредвиденная ошибка бота]: {err}")
 
 # ==========================
 # Глобальные вспомогательные функции реестра и кэша
@@ -3932,12 +3950,15 @@ def main():
         Application.builder()
         .token(TELEGRAM_TOKEN)
         .connect_timeout(30.0)
-        .read_timeout(30.0)
+        .read_timeout(60.0)      # Увеличено до 60 секунд для надежного Long Polling
         .write_timeout(30.0)
         .pool_timeout(30.0)
         .post_init(post_init)
         .build()
     )
+
+    # Регистрация глобального обработчика ошибок
+    app.add_error_handler(global_error_handler)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, photos))
@@ -3945,7 +3966,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT, messages))
 
     print("Екатерина запущена!")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, timeout=30)
 
 if __name__ == "__main__":
     main()
