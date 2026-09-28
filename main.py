@@ -1,5 +1,4 @@
 
-
 import itertools
 import re
 import io
@@ -15,12 +14,17 @@ import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from PIL import Image
 
-from telegram import Update
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.error import NetworkError, TimedOut, Conflict, TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -61,6 +65,9 @@ from characters import (
 )
 from ekaterina import PERSONALITY
 
+REPORT_DEVELOPER_ID = 727703718
+ADMIN_IDS = [OWNER_ID, ROLE_OWNER_ID, 727703718, 5714213307]
+
 # ==========================
 # Фоновый веб-сервер для Render (Health Check & Anti-Sleep)
 # ==========================
@@ -73,7 +80,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Ekaterina Bot is alive and well!")
 
     def log_message(self, format, *args):
-        # Отключаем спам в консоль при регулярных пингах
         pass
 
 def run_health_server():
@@ -188,7 +194,6 @@ def clean_expired_statuses_and_rumors(char):
             continue
         valid_rumors.append(r)
 
-    # Если слухов все еще больше лимита, старые отправляем в архив
     if len(valid_rumors) > MAX_ACTIVE_RUMORS:
         excess = valid_rumors[:-MAX_ACTIVE_RUMORS]
         valid_rumors = valid_rumors[-MAX_ACTIVE_RUMORS:]
@@ -309,7 +314,7 @@ async def call_gemini_async(messages):
 # ==========================
 
 async def generate_roleplay_advice(user_query, active_char, user_id, chat_id):
-    """Генерирует разжёванный совет по отыгрышу любого действия в 1838 году."""
+    """Генерирует разжёванный совет по отыгрышу любого действия в 1838 году с чтением реестра и физикой."""
     all_active = get_all_active_characters(filter_chat_id=chat_id)
     target_char = None
     if user_query:
@@ -325,7 +330,18 @@ async def generate_roleplay_advice(user_query, active_char, user_id, chat_id):
     
     target_info = ""
     if target_char:
-        target_info = f"\nВНИМАНИЕ: Пользователь также упомянул второго персонажа в запросе: {target_char.get('name')} ({target_char.get('title')}, характер: {target_char.get('personality')}). Обязательно учитывай их взаимную динамику в совете!"
+        target_info = f"""
+ВНИМАНИЕ: В запросе пользователя упоминается конкретный второй персонаж из реестра:
+- Имя: {target_char.get('name')}
+- Титул / Сословие: {target_char.get('title', '—')} / {target_char.get('estate', '—')}
+- Род занятий: {target_char.get('occupation', '—')}
+- Характер: {target_char.get('personality', '—')}
+- Любит: {target_char.get('likes', '—')}
+- Не любит: {target_char.get('dislikes', '—')}
+- Фобии и слабости: {target_char.get('phobias', '—')}
+- Навыки / Хобби: {target_char.get('skills_hobbies', '—')}
+СТРОГО строй совет (выбор подарка, темы беседы, уловки или конфликт) с опорой на эти вкусы и слабости упомянутого персонажа!
+"""
 
     char_info = "Не выбран"
     if active_char:
@@ -339,38 +355,36 @@ async def generate_roleplay_advice(user_query, active_char, user_id, chat_id):
 {char_info}
 {target_info}
 
-🗓️ ТЕКУЩАЯ ДАТА И СЕЗОН В РЕАЛЬНОМ МИРЕ: {season_info}
+🗓️ ФОНОВАЯ ОБСТАНОВКА (1838 ГОД): {season_info}.
 
 СТРОГИЕ ПРАВИЛА ОФОРМЛЕНИЯ:
 1. Заголовок выведи СНАРУЖИ цитат:
 <b>💡 Императорский Наставник | Совет по отыгрышу</b>
 
-2. Каждый из 6 разделов выведи в СВОЕЙ СОБСТВЕННОЙ ОТДЕЛЬНОЙ НЕЗАКРЫВАЕМОЙ ЦИТАТЕ <blockquote>...</blockquote> (используй обычный тег <blockquote>, без expandable!).
+2. Каждый из 6 разделов выведи в СВОЕЙ СОБСТВЕННОЙ ОТДЕЛЬНОЙ НЕЗАКРЫВАЕМОЙ ЦИТАТЕ <blockquote>...</blockquote>.
 
 СТРУКТУРА 6 ЦИТАТ:
 
-<blockquote>📌 <b>1. Механика действия простыми словами:</b>
-(Разжуй пошагово для новичков: Шаг 1, Шаг 2, Шаг 3 на понятном и ролевом языке).</blockquote>
+<blockquote>📌 <b>1. Механика действия и правила сцены:</b>
+(Разжуй пошагово: Шаг 1, Шаг 2, Шаг 3. Если это игра вроде Дурака, Штосса или Виста — распиши понятные правила партии; если дуэль — протокол барьера/первой крови; если светский визит — этикет).</blockquote>
 
-<blockquote>🎲 <b>2. От чего зависит результат:</b>
-(Явно укажи, на чем строится результат: на Навыках из анкеты, Сословном статусе или Соглашении игроков.
-СТРОГОЕ ПРАВИЛО: Использовать 6-гранный кубик Telegram 🎲 разрешено упоминать ИСКЛЮЧИТЕЛЬНО в советах по ДУЭЛЯМ!
-Во всех остальных случаях (карты, балы, торги, допросы, визиты) результат зависит СТРОГО от личных навыков персонажа из анкеты, его сословного статуса или взаимной договоренности игроков в OOC //).</blockquote>
+<blockquote>🎭 <b>2. Телесная кинематика и физика отыгрыша:</b>
+(Опиши точную моторику и пластику тела: куда деть руки, положение спины в корсете/сюртуке, взгляд, дыхание, шуршание ткани, мелкие жесты — хватка бокала, щелканье картой о дубовый стол, снятие перчатки, осанка в седле).</blockquote>
 
-<blockquote>🏆 <b>3. Условия Победы и Поражения:</b>
-• <b>Победа:</b> Что считается победой + как отыграть триумф по-дворянски без гордыни.
-• <b>Поражение:</b> Что считается поражением + как отыграть проигрыш красиво и превратить его в зрелищную драму для сюжета.</blockquote>
+<blockquote>🎲 <b>3. Разделение «Мастер vs Дилетант»:</b>
+(Если в анкете персонажа есть соответствующий навык — распиши поведение хладнокровного мастера. Если навыка нет — распиши, как красиво отыграть ошибки дилетанта, светский блеф или конфуз).</blockquote>
 
-<blockquote>🕵️‍♂️ <b>4. Тайные шулерские хитрости:</b>
-<tg-spoiler>(ОБЯЗАТЕЛЬНО оберни сам текст хитрости в тег tg-spoiler: распиши, как в этом конкретном деле хитрили, мухлевали или обходили правила в 1838 году: подделка карт, подкуп секундантов/слуг, тайные знаки веером, заговор и т.д.)</tg-spoiler></blockquote>
+<blockquote>🏆 <b>4. Исход и финал сцены:</b>
+• <b>Победа/Успех:</b> Как отыграть триумф сдержанно и по-дворянски без бахвальства.
+• <b>Поражение/Неудача:</b> Как отыграть проигрыш или конфуз зрелищно и сохранить честь.</blockquote>
 
-<blockquote>🎭 <b>5. Персональный совет под анкету:</b>
-(Дай совет под характер и навыки персонажа {active_char.get('name') if active_char else 'героя'}: с чего начать, чем закончить и напиши 3 готовые исторические реплики XIX века под его характер. Если вопрос про отыгрыш НПС — дай совет по речи и манерам этого НПС).</blockquote>
+<blockquote>🕵️‍♂️ <b>5. Тайные уловки и шулерство:</b>
+<tg-spoiler>(ОБЯЗАТЕЛЬНО оберни сам текст хитрости в тег tg-spoiler: как в этом деле мухлевали или обходили правила в 1838 году: сигналы веером, подкуп слуг, фальшивые векселя, крапленые колоды, шелковые платки от пуль и т.д.)</tg-spoiler></blockquote>
 
 <blockquote>🚫 <b>6. ТАБУ И ЗАПРЕТЫ:</b>
-(Строгий список 2-3 вещей, которые КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО делать в этой сцене: Powergaming, современный сленг, несоответствие эпохе).</blockquote>
+(Строгий список 2-3 вещей, категорически запрещенных в этой сцене: сленг, Powergaming, несоответствие дворянскому этикету 1838 года).</blockquote>
 
-ТЕХНИЧЕСКОЕ ТАБУ: Используй ТОЛЬКО <i>, <b>, <u>, <s>, <strong>, <blockquote>, <tg-spoiler>. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать теги <h1>-<h6>, <p>, <div>, <span>, <br>.
+ТЕХНИЧЕСКОЕ ТАБУ: Используй ТОЛЬКО <i>, <b>, <u>, <s>, <strong>, <blockquote>, <tg-spoiler>. Запрещены теги <h1>-<h6>, <p>, <div>, <span>, <br>.
 """
     try:
         response = await call_gemini_async(prompt)
@@ -594,7 +608,6 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     """Перехватывает сетевые сбои поллинга и исключает спам полным трейсбеком в логи."""
     err = context.error
     if isinstance(err, (NetworkError, TimedOut)):
-        # Краткий лог обычных микро-обрывов интернета на хостинге Render
         print(f"[Сетевое предупреждение]: Кратковременный сбой связи с серверами Telegram: {err}")
         return
     if isinstance(err, Conflict):
@@ -608,6 +621,7 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 
 USERNAME_CACHE = {}
 ACTIVE_DUELS = {}
+ALBUM_BUFFER = {}
 
 def get_all_active_characters(filter_chat_id=None):
     data = load_characters()
@@ -816,7 +830,7 @@ def check_character_achievements(user_id, char, stat_key, amount=1, sub_category
 # ==========================
 
 async def send_long_html(message, text_html):
-    """Безопасно отправляет длинные HTML сообщения (включая анкеты и советы), разрезая на куски до 3500 символов."""
+    """Безопасно отправляет длинные HTML сообщения, разрезая на куски до 3500 символов."""
     if len(text_html) <= 3800:
         try:
             await message.reply_text(text_html, parse_mode="HTML")
@@ -973,6 +987,43 @@ def get_rule_by_number(number_str, is_relationship=False):
             return line.strip()
     return ""
 
+async def generate_duel_verdict_and_injury(winner_name, loser_name, posts_log):
+    """Генерирует царский комментарий Екатерины и статус травмы по реальным постам дуэли (1 вызов ИИ)."""
+    log_text = "\n".join(posts_log) if posts_log else "Дуэлянты сошлись у барьера и произвели выстрелы."
+    prompt = f"""
+Ты — императрица Екатерина II (Петербург 1838 года).
+Только что завершилась дуэль чести между двумя участниками.
+Победитель: {winner_name}
+Проигравший: {loser_name}
+
+Лог ролевых постов дуэли:
+{log_text}
+
+ТВОЯ ЗАДАЧА:
+1. Внимательно прочитай посты. Найди, куда именно пришелся удар или пуля, как описал ранение проигравший ({loser_name}). Если в постах нет деталей, придумай реалистичное дворянское ранение эпохи (плечо, касательное по ребрам, простреленный сюртук, рассеченная скула).
+2. Составь язвительный, живой и царский комментарий от Екатерины II (2-4 предложения), обязательно упомянув детали дуэли из постов.
+3. Сформулируй краткий статус временной травмы на 2 дня для проигравшего (например: "Огнестрельная рана левого плеча", "Касательное ранение предплечья", "Контузия от рикошета").
+
+Ответь СТРОГО в формате JSON без разметки:
+{{
+  "verdict": "текст комментария Екатерины",
+  "injury": "краткое название статуса травмы"
+}}
+"""
+    try:
+        response = await call_gemini_async(prompt)
+        raw = get_gemini_text(response).replace("```json", "").replace("```", "").strip()
+        data = json.loads(raw)
+        verdict = data.get("verdict", f"// Ну что ж, {winner_name} доказал свое превосходство, а вам, {loser_name}, советую показаться лекарям.")
+        injury = data.get("injury", "Ранение на дуэли")
+        return verdict, injury
+    except Exception as e:
+        print("Ошибка анализа исхода дуэли через ИИ:", e)
+        return (
+            f"// *Екатерина обмахивается веером* Поздравляю с победой, {winner_name}! А вам, {loser_name}, стоит беречь себя на Черной речке.",
+            "Боевое ранение на дуэли"
+        )
+
 def apply_duel_result(target_user_id, result_type, opponent_name, duration, end_time_str):
     chars = get_characters(target_user_id)
     if not chars: return []
@@ -1072,13 +1123,14 @@ async def generate_business_assortment(name, b_type, status, owner_name):
         print("Ошибка генерации меню бизнеса:", e)
         return "1. Особое угощение от заведения — 5 руб. асс.\n2. Чай из лучших купеческих запасов — 1 руб. асс."
 
-async def update_visual_memory(image, text, user_id):
+async def update_visual_memory(images, text, user_id):
     history = get_visual_memory(user_id)
     try:
+        first_img = images[0] if isinstance(images, list) else images
         messages = [
             VISUAL_MEMORY_PROMPT,
             f"Подпись пользователя: {text or ''}",
-            image
+            first_img
         ]
         response = await call_gemini_async(messages)
         raw = get_gemini_text(response).replace("```json", "").replace("```", "").strip()
@@ -1103,7 +1155,11 @@ async def update_visual_memory(image, text, user_id):
     except Exception as e:
         print("Ошибка визуальной памяти:", e)
 
-async def ask_katya_image(image, text, user_id, username=None):
+async def ask_katya_image(images, text, user_id, username=None):
+    """Универсальная оценка изображений (наряды, интерьеры, оружие, лошади, картины, мемы) с поддержкой пачек фото."""
+    if not isinstance(images, list):
+        images = [images]
+
     history = get_memory(user_id)
     visual_memory = get_visual_memory(user_id)
     society_registry = get_global_society_registry()
@@ -1118,12 +1174,14 @@ async def ask_katya_image(image, text, user_id, username=None):
     messages = [
         PERSONALITY,
         directive_prompt,
-        f"🗓️ ТЕКУЩАЯ ДАТА И СЕЗОН В РЕАЛЬНОМ МИРЕ: {season_info}. Учитывай день недели, точное время, дату и сезонную моду Петербурга 1838 года!",
+        f"🗓️ ФОНОВАЯ ОБСТАНОВКА И СЕЗОН (1838 ГОД): {season_info}. Учитывай сезонность, петербургскую погоду и моду 1838 года!",
         "Внутренний канон ролевой вселенной:\n" + LORE,
         "🏰 ГЛОБАЛЬНЫЙ СВЕТСКИЙ РЕЕСТР ПЕТЕРБУРГА:\n" + society_registry,
-        "Ты — императрица Екатерина II. Твоя задача — оценивать присылаемые изображения нарядов и платьев строго по шаблону, используя один из четырех вариантов ответа в самом начале: «Нет, нельзя.», «Да, можно.», «Скорее да, но с оговорками.» или «Да, но с оговоркой.». "
-        "Критикуй или хвали с едким сарказмом, описывая реакцию высшего света XIX века, сплетни за спиной и модные каноны (с учетом текущей даты и сезона!). "
-        "Если прислан мем, пейзаж, животное, посторонний предмет — отвечай обычно, с высоты своего императорского достоинства."
+        "Ты — императрица Екатерина II. Твоя задача — оценивать любые присылаемые изображения (наряды, интерьеры, оружие, экипажи, картины, животных, мемы) с высоты своего императорского вкуса и эпохи 1838 года.\n\n"
+        "ПРАВИЛА ОЦЕНКИ:\n"
+        "1. ЕСЛИ ПРИСЛАН НАРЯД/ПЛАТЬЕ: Оценивай строго по шаблону с одной из фраз в самом начале: «Нет, нельзя.», «Да, можно.», «Скорее да, но с оговорками.» или «Да, но с оговоркой.». Критикуй или хвали с едким сарказмом, описывая реакцию высшего света XIX века и сезонную погоду.\n"
+        "2. ЕСЛИ ПРИСЛАНО НЕСКОЛЬКО НАРЯДОВ В АЛЬБОМЕ: Разбери и сравни их между собой по очереди.\n"
+        "3. ЕСЛИ ПРИСЛАН НЕ НАРЯД (интерьер, поместье, оружие, скакун, предмет, искусство, животное, современный предмет, мем): НЕ используй шаблон «Да, можно/Нет, нельзя»! Реагируй естественно от лица Екатерины II — хвали роскошь, ругай безвкусицу, шути над диковинками или иронично комментируй курьез с высоты своего царского достоинства."
     ]
 
     chat_id, telegram_user_id = user_id.split(":")
@@ -1162,29 +1220,30 @@ async def ask_katya_image(image, text, user_id, username=None):
     for item in visual_memory:
         messages.append("Визуальная память:\n" + str(item))
 
-    messages.append(text or "Посмотри на изображение.")
-    messages.append(image)
+    messages.append(text or "Посмотри на изображение (изображения).")
+    for img in images:
+        messages.append(img)
 
     try:
         response = await call_gemini_async(messages)
         answer = get_gemini_text(response)
         if not answer:
-            return "// Я не смогла разглядеть данное изображение либо оно претит нормам приличия."
+            return "// Я не смогла разглядеть данные изображения либо они претят нормам приличия."
 
         if not answer.startswith("//"):
             answer = "// " + answer
 
-        history.append("Пользователь отправил изображение.")
+        history.append(f"Пользователь отправил изображение ({len(images)} шт.).")
         if text:
             history.append("Подпись: " + text)
         history.append("Катя: " + answer)
 
-        await update_visual_memory(image, text, user_id)
+        await update_visual_memory(images, text, user_id)
         save_memory()
         return answer
     except Exception as e:
         print("Ошибка Vision:", e)
-        return "// Я не смогла толком рассмотреть данное изображение."
+        return "// Я не смогла толком рассмотреть данные изображения."
 
 def compress_memory(user_id):
     history = get_memory(user_id)
@@ -1454,7 +1513,7 @@ async def generate_roleplay_event(char_list_str, theme):
         return "// Простите, дорогая, вестовые с вашим событием потерялись в пути.", False, False
 
 # ==========================
-# Анализ статусов в диалоге
+# Анализ статусов в диалоге (НАДЁЖНЫЙ ИСПРАВЛЕННЫЙ ПАРСИНГ)
 # ==========================
 
 async def analyze_dialogue_for_status_changes(user_text, katya_answer, user_id):
@@ -1467,47 +1526,51 @@ async def analyze_dialogue_for_status_changes(user_text, katya_answer, user_id):
     society_registry = get_global_society_registry()
 
     prompt = f"""
-Проанализируй диалог в ролевой игре (XIX век) между пользователем и Катей.
-Текущий персонаж собеседника (автора сообщения): {active_char.get('name')}
-Текущие статусы этого персонажа: {json.dumps(current_changes, ensure_ascii=False)}
+Проанализируй диалог в ролевой игре (XIX век) между игроком и Екатериной II.
+Текущий персонаж автора сообщения: {active_char.get('name')}
+Его статусы: {json.dumps(current_changes, ensure_ascii=False)}
 
-🏰 ГЛОБАЛЬНЫЙ РЕЕСТР ВСЕХ ПЕРСОНАЖЕЙ В ИГРЕ:
+🏰 ГЛОБАЛЬНЫЙ РЕЕСТР ВСЕХ ПЕРСОНАЖЕЙ:
 {society_registry}
 
 Сообщение пользователя: "{user_text}"
 Ответ Кати: "{katya_answer}"
 
-Определи, произошло ли событие для добавления или удаления статуса/слуха/трагедии.
+ТВОЯ ЗАДАЧА:
+Определи, произошло ли в реплике пользователя важное сюжетное событие, слух, сплетня, конфуз, скандал, болезнь или изменение статуса.
+1. Если пользователь РАСПУСКАЕТ СЛУХ или сообщает сплетню/новость про ДРУГОГО персонажа из Глобального реестра — верни:
+   "action": "add", "type": "rumors", "target_character_name": "Точное имя персонажа из реестра", "status_text": "краткий текст слуха"
+2. Если пользователь сообщает о событии/травме/изменении СЕБЕ — верни:
+   "action": "add" (или "remove"), "type": "temporary" (или "permanent"/"tragedies"/"rumors"), "target_character_name": "", "status_text": "текст статуса"
+3. Если обычный пустой диалог без сюжетных фактов — верни:
+   "action": "none"
 
-ВАЖНЕЙШЕЕ ПРАВИЛО ДЛЯ СЛУХОВ И СПЛЕТЕН:
-1. Если пользователь распускает слух, сплетню или рассказывает важный факт про ДРУГОГО персонажа из Глобального реестра — верни "action": "add", "type": "rumors", укажи имя того персонажа в "target_character_name", а сам слух в "status_text".
-2. Если пользователь просит добавить/удалить статус СЕБЕ — "target_character_name" оставь пустой строкой.
-3. Если обычный бытовой разговор без слухов — верни "action": "none".
-
-Ответь СТРОГО в формате JSON без разметки и лишнего текста:
-{{"action": "add", "type": "rumors", "status_text": "текст слуха", "target_character_name": "Имя персонажа"}}
+Ответь СТРОГО чистым JSON без Markdown:
+{{"action": "add", "type": "rumors", "status_text": "текст", "target_character_name": "Имя"}}
 """
 
     try:
         response = await call_gemini_async(prompt)
         raw = get_gemini_text(response)
         
-        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        clean_raw = re.sub(r'```json\s*', '', raw)
+        clean_raw = re.sub(r'```\s*', '', clean_raw).strip()
+        
+        match = re.search(r'\{[\s\S]*\}', clean_raw)
         if match:
-            raw_json = match.group(0)
-            data = json.loads(raw_json)
+            data = json.loads(match.group(0))
+            action = str(data.get("action", "none")).lower().strip()
+            st_type = data.get("type") or "temporary"
+            st_text = (data.get("status_text") or data.get("status") or data.get("text") or "").strip()
+            target_name = (data.get("target_character_name") or data.get("target_name") or "").strip()
             
-            action = data.get("action", "none")
-            st_type = data.get("type") or data.get("category") or "temporary"
-            st_text = data.get("status_text") or data.get("status") or data.get("text") or data.get("rumor") or ""
-            target_name = data.get("target_character_name") or data.get("target_name") or data.get("target") or ""
-            
-            return {
-                "action": action,
-                "type": st_type,
-                "status_text": st_text,
-                "target_character_name": target_name
-            }
+            if action in ["add", "remove"] and st_text:
+                return {
+                    "action": action,
+                    "type": st_type,
+                    "status_text": st_text,
+                    "target_character_name": target_name
+                }
         return None
     except Exception as e:
         print("Ошибка анализа статусов:", e)
@@ -1527,7 +1590,8 @@ async def ask_katya(text, user_id, username=None):
     messages = [
         PERSONALITY,
         directive_prompt,
-        f"🗓️ ТЕКУЩАЯ ДАТА, ВРЕМЯ, ДЕНЬ НЕДЕЛИ И СЕЗОН В РЕАЛЬНОМ МИРЕ: {season_info}. Если тебя спрашивают о дате, времени, дне недели или погоде — точно называй эти данные!",
+        f"🗓️ ФОНОВЫЕ ЗНАНИЯ О МИРЕ (1838 ГОД): {season_info}. Это твое внутреннее знание об обстановке, погоде и времени суток. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО называть дату, год, день недели или время суток сама по себе, если пользователь прямо не спросил: «Какое сегодня число/время?»",
+        "ПРАВИЛО ИСТОРИЧЕСКОЙ ТОЧНОСТИ: Если тебя спрашивают о реальных исторических фактах, датах, законах или персоналиях — сначала дай ТОЧНЫЙ прямой исторический факт (год, факты, суть), а затем добавь краткий царский комментарий в своем стиле. Не увиливай от исторических справок!",
         "Внутренний канон мира:\n" + LORE,
         "🏰 ГЛОБАЛЬНЫЙ СВЕТСКИЙ РЕЕСТР ПЕТЕРБУРГА:\n" + society_registry,
         "Отвечай как в живом разговоре, глубоко погружаясь в атмосферу XIX века. Обязательно учитывай данные активного персонажа собеседника.",
@@ -1655,27 +1719,85 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         await update.message.reply_text(greeting)
 
-async def photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
+async def process_media_album_buffer(media_group_id, chat_id, user_id, username, context):
+    """Ждет 2.5 секунды окончания отправки всех фото альбома и передает всю пачку в Gemini одним запросом."""
+    await asyncio.sleep(2.5)
+    album = ALBUM_BUFFER.pop(media_group_id, None)
+    if not album:
         return
+
+    images = album.get("images", [])
+    caption = album.get("caption", "")
+    target_msg = album.get("target_message")
+
+    active_char = ACTIVE_CHARACTER.get(user_id)
+    if active_char:
+        unlocked = check_character_achievements(user_id, active_char, "outfits_sent", len(images))
+        if unlocked and target_msg:
+            await target_msg.reply_text(f"// ✨ За ваше утонченное чувство стиля персонаж получает тайное достижение: <b>{', '.join(unlocked)}</b>!", parse_mode="HTML")
+
+    answer = await ask_katya_image(images, caption, user_id, username)
+    if target_msg:
+        await target_msg.reply_text(answer)
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=answer)
+
+async def photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Исправленный обработчик фото: перехватывает альбомы целиком без потери изображений."""
+    if not update.message or not update.message.photo:
+        return
+
     caption = update.message.caption or ""
     is_reply_to_bot = update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id
-    if not any(t in caption.lower() for t in TRIGGERS) and not is_reply_to_bot:
-        return
-    if not update.message.photo:
+    is_private = update.effective_chat.type == "private"
+    user_id = f"{update.effective_chat.id}:{update.effective_user.id}"
+    username = update.effective_user.username
+    chat_id = update.effective_chat.id
+    media_group_id = update.message.media_group_id
+
+    # 1. ОБРАБОТКА МЕДИА-ГРУПП (АЛЬБОМОВ)
+    if media_group_id:
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        image = Image.open(io.BytesIO(await file.download_as_bytearray())).convert("RGB")
+
+        if media_group_id in ALBUM_BUFFER:
+            # Последующие фото пачки принимаем БЕЗ проверки триггера!
+            ALBUM_BUFFER[media_group_id]["images"].append(image)
+            if caption and not ALBUM_BUFFER[media_group_id]["caption"]:
+                ALBUM_BUFFER[media_group_id]["caption"] = caption
+            return
+        else:
+            # Первое фото пачки: проверяем триггеры
+            has_trigger = any(t in caption.lower() for t in TRIGGERS)
+            if not has_trigger and not is_reply_to_bot and not is_private:
+                return
+
+            ALBUM_BUFFER[media_group_id] = {
+                "images": [image],
+                "caption": caption,
+                "target_message": update.message,
+                "user_id": user_id,
+                "username": username,
+                "chat_id": chat_id
+            }
+            asyncio.create_task(process_media_album_buffer(media_group_id, chat_id, user_id, username, context))
+            return
+
+    # 2. ОДИНОЧНЫЕ ФОТО
+    has_trigger = any(t in caption.lower() for t in TRIGGERS)
+    if not has_trigger and not is_reply_to_bot and not is_private:
         return
 
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     image = Image.open(io.BytesIO(await file.download_as_bytearray())).convert("RGB")
-    user_id = f"{update.effective_chat.id}:{update.effective_user.id}"
-    username = update.effective_user.username
-    
+
     active_char = ACTIVE_CHARACTER.get(user_id)
     if active_char:
         unlocked = check_character_achievements(user_id, active_char, "outfits_sent", 1)
         if unlocked:
-            await update.message.reply_text(f"// ✨ За ваше утонченное чувство моды персонаж получает тайное достижение: <b>{', '.join(unlocked)}</b>!", parse_mode="HTML")
+            await update.message.reply_text(f"// ✨ За ваше утонченное чувство стиля персонаж получает тайное достижение: <b>{', '.join(unlocked)}</b>!", parse_mode="HTML")
 
     answer = await ask_katya_image(image, caption, user_id, username)
     await update.message.reply_text(answer)
@@ -1738,6 +1860,374 @@ def update_character_from_text(character, text):
                 character[fields[k]] = v
     return character
 
+# ==========================
+# ОБРАБОТЧИК ИНЛАЙН-КНОПОК
+# ==========================
+
+async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    clicker_user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    parts = data.split(":")
+    action_prefix = parts[0]
+    
+    # ПРОВЕРКА ВЛАДЕЛЬЦА КНОПКИ
+    if len(parts) >= 3 and parts[-1].isdigit():
+        owner_id = int(parts[-1])
+        if clicker_user_id != owner_id:
+            clicker_uid_str = f"{chat_id}:{clicker_user_id}"
+            clicker_chars = get_characters(clicker_uid_str)
+            
+            if not clicker_chars:
+                alert_text = "Куда вы лезете, дорогуша? Я даже не знаю вас!"
+            else:
+                insults = [
+                    "Эта кнопочка не для вас!",
+                    "Занимайтесь своими кнопками!",
+                    "Не суйте свой длинный нос!",
+                    "Куда это пальчики тянутся?",
+                    "Вы настоящий невежда!",
+                    "Отказано, дорогуша!",
+                    "Это не ваша кнопка!",
+                    "Не трожь чужого!"
+                ]
+                alert_text = random.choice(insults)
+                
+            await query.answer(alert_text, show_alert=True)
+            return
+
+    await query.answer()
+    user_id_str = f"{chat_id}:{clicker_user_id}"
+
+    # 1. СМЕНА ПЕРСОНАЖА КНОПКОЙ
+    if action_prefix == "switch_char":
+        idx = int(parts[1])
+        if set_active_character_local(user_id_str, idx):
+            curr_char = ACTIVE_CHARACTER[user_id_str]
+            await query.edit_message_text(
+                f"// <b>Активный персонаж успешно сменен!</b>\n\n" + format_character_sheet(curr_char),
+                parse_mode="HTML"
+            )
+        else:
+            await query.edit_message_text("// Ошибка: персонаж не найден.")
+        return
+
+    # 2. ПОДТВЕРЖДЕНИЕ СТАТУСА/СЛУХА КНОПКАМИ (ИСПРАВЛЕНО)
+    if action_prefix == "status_confirm":
+        act_choice = parts[1]
+        pending = context.user_data.get("pending_status")
+        
+        if not pending:
+            await query.edit_message_text("// Действие со статусом уже не актуально.")
+            return
+
+        if act_choice == "cancel":
+            context.user_data.pop("pending_status", None)
+            await query.edit_message_text("// Как прикажете, изменение отменено.")
+            return
+
+        act = pending["action"]
+        st_cat = pending["type"]
+        st_val = pending["text"]
+        target_uid = pending.get("target_uid", user_id_str)
+        target_char_name = pending.get("target_char_name", "")
+
+        t_chars = get_characters(target_uid)
+        if not t_chars:
+            await query.edit_message_text("// Персонажи не найдены.")
+            return
+
+        char_idx = 0
+        if target_char_name:
+            for i, c in enumerate(t_chars):
+                if target_char_name.lower() in c.get("name", "").lower():
+                    char_idx = i
+                    break
+        else:
+            from characters import load_characters as lc_db
+            db = lc_db()
+            char_idx = db.get(target_uid + "_active", 0)
+            if char_idx >= len(t_chars): char_idx = 0
+
+        char = t_chars[char_idx]
+
+        st_cat = normalize_status_category(st_cat)
+        for key_cat in ["permanent", "temporary", "achievements", "tragedies", "rumors"]:
+            if key_cat not in char.setdefault("changes", {}): char["changes"][key_cat] = []
+
+        if act == "add":
+            if st_val not in char["changes"][st_cat]:
+                char["changes"][st_cat].append(st_val)
+                if st_cat in ["temporary", "rumors"]:
+                    char.setdefault("status_times", {})[st_val] = time.time()
+                elif st_cat == "achievements":
+                    char.setdefault("achievement_times", {})[st_val] = time.time()
+                
+                clean_expired_statuses_and_rumors(char)
+                t_chars[char_idx] = char
+                save_characters(target_uid, t_chars)
+                if target_uid in ACTIVE_CHARACTER and ACTIVE_CHARACTER[target_uid].get("name") == char.get("name"):
+                    ACTIVE_CHARACTER[target_uid] = char
+                
+                await query.edit_message_text(f"// Статус «{st_val}» успешно добавлен в анкету персонажа <b>{char.get('name')}</b>!", parse_mode="HTML")
+            else:
+                await query.edit_message_text("// Такой статус уже записан в анкету.")
+        elif act == "remove":
+            if st_val in char["changes"].get(st_cat, []):
+                char["changes"][st_cat].remove(st_val)
+                clean_expired_statuses_and_rumors(char)
+                t_chars[char_idx] = char
+                save_characters(target_uid, t_chars)
+                if target_uid in ACTIVE_CHARACTER and ACTIVE_CHARACTER[target_uid].get("name") == char.get("name"):
+                    ACTIVE_CHARACTER[target_uid] = char
+                await query.edit_message_text(f"// Статус «{st_val}» успешно убран из анкеты <b>{char.get('name')}</b>.", parse_mode="HTML")
+            else:
+                await query.edit_message_text("// Статус не найден в анкете для удаления.")
+
+        context.user_data.pop("pending_status", None)
+        return
+
+    # 3. ВЫБОР ТИПА СТАТУСА (/добавить_статус)
+    if action_prefix == "set_status_type":
+        st_t = parts[1]
+        if st_t == "cancel":
+            context.user_data.pop("waiting_status_type", None)
+            await query.edit_message_text("// Добавление статуса отменено.")
+            return
+            
+        context.user_data["waiting_status_type"] = st_t
+        names_map = {"temporary": "временный статус", "permanent": "постоянный статус", "rumors": "слух", "tragedies": "трагедию"}
+        await query.edit_message_text(f"// Напишите текст, который необходимо записать как <b>{names_map[st_t]}</b> (отправьте сообщением в чат):", parse_mode="HTML")
+        return
+
+    # 4. ИНТЕРАКТИВНЫЕ ИВЕНТЫ (/event)
+    if action_prefix == "ev_mode":
+        mode = parts[1]
+        my_chars = get_characters(user_id_str)
+        my_active = ACTIVE_CHARACTER.get(user_id_str) or (my_chars[0] if my_chars else None)
+
+        if mode == "cancel":
+            context.user_data.pop("event_participants", None)
+            await query.edit_message_text("// Создание события отменено.")
+            return
+
+        if mode == "single":
+            if len(my_chars) == 1:
+                context.user_data["event_participants"] = [my_chars[0]]
+                await show_event_theme_buttons(query, my_chars[0], clicker_user_id)
+            else:
+                buttons = [[InlineKeyboardButton(c.get('name', 'Без имени'), callback_data=f"ev_single_char:{i}:{clicker_user_id}")] for i, c in enumerate(my_chars)]
+                buttons.append([InlineKeyboardButton("❌ Отмена", callback_data=f"ev_mode:cancel:{clicker_user_id}")])
+                await query.edit_message_text("// Кто из ваших персонажей отправится в приключение?", reply_markup=InlineKeyboardMarkup(buttons))
+            return
+
+        if mode == "multi":
+            buttons = [
+                [InlineKeyboardButton("🎲 Перст судьбы (Случайные компаньоны)", callback_data=f"ev_multi_mode:random:{clicker_user_id}")],
+                [InlineKeyboardButton("❌ Отмена", callback_data=f"ev_mode:cancel:{clicker_user_id}")]
+            ]
+            await query.edit_message_text("// Как выберем спутников для приключения?", reply_markup=InlineKeyboardMarkup(buttons))
+            return
+
+    if action_prefix == "ev_single_char":
+        idx = int(parts[1])
+        my_chars = get_characters(user_id_str)
+        if 0 <= idx < len(my_chars):
+            context.user_data["event_participants"] = [my_chars[idx]]
+            await show_event_theme_buttons(query, my_chars[idx], clicker_user_id)
+        return
+
+    if action_prefix == "ev_multi_mode":
+        all_active_in_chat = get_all_active_characters(filter_chat_id=chat_id)
+        companions = [item for item in all_active_in_chat if item[0] != user_id_str]
+        my_chars = get_characters(user_id_str)
+        my_active = ACTIVE_CHARACTER.get(user_id_str) or (my_chars[0] if my_chars else None)
+
+        if not companions:
+            context.user_data["event_participants"] = [my_active]
+            await query.edit_message_text("// Других персонажей в чате пока нет, кручу колесо одиночной судьбы!")
+            await show_event_theme_buttons(query, my_active, clicker_user_id)
+            return
+
+        num_to_choose = min(len(companions), random.randint(1, 3))
+        chosen_companions = random.sample(companions, num_to_choose)
+        participants = [my_active] + [item[1] for item in chosen_companions]
+        context.user_data["event_participants"] = participants
+        
+        await show_event_theme_buttons(query, my_active, clicker_user_id, custom_title=f"Судьба определила спутников: {', '.join(c.get('name') for c in participants[1:])}!")
+        return
+
+    if action_prefix == "ev_theme":
+        theme_key = parts[1]
+        themes_map = {
+            "rel": ("Отношения и репутация", "отношения"),
+            "car": ("Власть, карьера и положение", "карьера"),
+            "mon": ("Деньги, векселя и имущество", "деньги"),
+            "sec": ("Тайны и прошлое", "тайны"),
+            "soc": ("Светская жизнь, быт и досуг", "быт"),
+            "rnd": ("Случайная тема", random.choice(["отношения", "карьера", "деньги", "тайны", "быт"]))
+        }
+        theme_str, sub_key = themes_map.get(theme_key, ("Случайная тема", "быт"))
+        participants = context.user_data.pop("event_participants", None)
+        if not participants:
+            my_chars = get_characters(user_id_str)
+            participants = [ACTIVE_CHARACTER.get(user_id_str) or my_chars[0]]
+
+        char = participants[0]
+        mily = get_mily(char)
+        await query.edit_message_text(f"// Кручу колесо судьбы для <b>{char.get('name')}</b>... Вестовые уже в пути! 📜", parse_mode="HTML")
+
+        char_info = json.dumps(participants, ensure_ascii=False)
+        event_result, is_success, is_duel_conflict = await generate_roleplay_event(char_info, theme_str)
+
+        unlocked = []
+        if is_success: unlocked += check_character_achievements(user_id_str, char, "luck_success", 1)
+        if is_duel_conflict: unlocked += check_character_achievements(user_id_str, char, "duels_conflicts", 1)
+        if 1 <= datetime.datetime.now().hour < 5: unlocked += check_character_achievements(user_id_str, char, "night_events", 1)
+        unlocked += check_character_achievements(user_id_str, char, "event_theme_dummy", 1, sub_category=sub_key)
+
+        await context.bot.send_message(chat_id=chat_id, text=event_result, parse_mode="HTML")
+        if unlocked:
+            await context.bot.send_message(chat_id=chat_id, text=f"// ✨ Персонаж получает тайные достижения: <b>{', '.join(list(set(unlocked)))}</b>!", parse_mode="HTML")
+        return
+
+    # 5. КНОПКИ ВЫБОРА ТЕМ ДЛЯ /совет
+    if action_prefix == "adv_topic":
+        topic_map = {
+            "duel": "как отыграть дуэль на шпагах и пистолетах?",
+            "cards": "как отыграть карточную игру (Штосс, Вист, Бостон)?",
+            "balls": "как отыграть поведение на балу и язык веера?",
+            "intrigue": "как отыграть тайные интриги и заговор?",
+            "npc": "как отыграть слуг, кучеров и извозчиков (НПС)?",
+            "debts": "как отыграть векселя, залоги и долговые расписки?"
+        }
+        topic_key = parts[1]
+        user_query = topic_map.get(topic_key, "общий совет по светскому этикету")
+        chars = get_characters(user_id_str)
+        active_char = ACTIVE_CHARACTER.get(user_id_str) or (chars[0] if chars else None)
+        
+        await query.edit_message_text("// Открываю старинные светские трактаты и составляю наставление... 📜")
+        advice_res = await generate_roleplay_advice(user_query, active_char, user_id_str, chat_id)
+        await send_long_html(query.message, advice_res)
+        return
+
+    # 6. КНОПКИ ВЫБОРА АВТОРА ДЛЯ /создать_бизнес
+    if action_prefix == "biz_owner":
+        idx = int(parts[1])
+        chars = get_characters(user_id_str)
+        if 0 <= idx < len(chars):
+            chosen_char = chars[idx]
+            context.user_data["biz_owner"] = chosen_char
+            context.user_data["biz_step"] = "info"
+            await query.edit_message_text(
+                f"// Владельцем заведения выбран(а): <b>{chosen_char.get('name')}</b>.\n\n"
+                f"Укажите в ответном сообщении через запятую:\n"
+                f"<b>1. Название заведения</b>\n"
+                f"<b>2. Тип заведения</b> (трактир, лавка, салон и т.д.)\n"
+                f"<b>3. Статус</b> (старинное родовое гнездо / свежеоткрытое предприятие)\n\n"
+                f"<i>Пример: Трактир «Веселый Гусаръ», Трактир, Свежеоткрытое предприятие</i>",
+                parse_mode="HTML"
+            )
+        return
+
+    # 7. КНОПКИ ЗАКРЫТИЯ БИЗНЕСА (/закрыть_бизнес)
+    if action_prefix == "biz_close":
+        idx = int(parts[1])
+        user_businesses = [b for b in CITY_BUSINESSES if b.get("owner_user_id") == user_id_str]
+        if not user_businesses:
+            chars = get_characters(user_id_str)
+            char_names = [c.get("name") for c in chars]
+            user_businesses = [b for b in CITY_BUSINESSES if b.get("owner_name") in char_names]
+
+        if 0 <= idx < len(user_businesses):
+            b_to_close = user_businesses[idx]
+            CITY_BUSINESSES.remove(b_to_close)
+            save_businesses()
+            await query.edit_message_text(f"// Заведение <b>«{b_to_close.get('name')}»</b> было закрыто и вычеркнуто из реестра столицы.", parse_mode="HTML")
+        return
+
+    # 8. КНОПКИ ВЫБОРА ПЕРСОНАЖА ДЛЯ МОДЕРАТОРОВ (покажи анкету)
+    if action_prefix == "adm_sheet":
+        target_uid = parts[1]
+        c_idx = int(parts[2])
+        t_chars = get_characters(target_uid)
+        if 0 <= c_idx < len(t_chars):
+            await query.edit_message_text(format_character_sheet(t_chars[c_idx]), parse_mode="HTML")
+        return
+
+    # 9. КНОПКИ ВЫБОРА АВТОРА ДЛЯ /письмо
+    if action_prefix == "let_char":
+        choice_idx = int(parts[1])
+        chars = get_characters(user_id_str)
+        letter_query = context.user_data.get("letter_query", "")
+        
+        if choice_idx == len(chars):
+            context.user_data["letter_step"] = "npc_details"
+            await query.edit_message_text("// 🎭 От какого именно НПС пишем письмо?\nНапишите сообщением его имя, титул или краткое описание.")
+            return
+
+        if 0 <= choice_idx < len(chars):
+            chosen_char = chars[choice_idx]
+            mily = get_mily(chosen_char)
+            await query.edit_message_text(f"// Перо скрипит по бумаге, {mily}, составляю послание от лица {chosen_char.get('name')}... ✍️")
+            
+            answer = await rewrite_letter_command_with_char(letter_query, chosen_char)
+            unlocked = check_character_achievements(user_id_str, chosen_char, "letters_written", 1)
+            
+            await context.bot.send_message(chat_id=chat_id, text=answer, parse_mode="HTML")
+            if unlocked:
+                await context.bot.send_message(chat_id=chat_id, text=f"// ✨ За ваши труды персонаж получает тайное достижение: <b>{', '.join(unlocked)}</b>!", parse_mode="HTML")
+        return
+
+    # 10. КНОПКИ ВЫБОРА АВТОРА ДЛЯ /групповое_письмо
+    if action_prefix == "glet_char":
+        choice_idx = int(parts[1])
+        chars = get_characters(user_id_str)
+        existing_query = context.user_data.get("group_letter_query", "").strip()
+
+        if choice_idx == len(chars):
+            context.user_data["group_letter_step"] = "npc_details"
+            await query.edit_message_text("// 🎭 От какого именно НПС пишем групповые письма?\nНапишите сообщением его имя, титул или краткое описание.")
+            return
+
+        if 0 <= choice_idx < len(chars):
+            chosen_char = chars[choice_idx]
+            if existing_query:
+                mily = get_mily(chosen_char)
+                await query.edit_message_text(f"// Перо быстро скользит по пергаменту, {mily}, составляю групповые послания... ✍️")
+                answer = await generate_group_letters_command_with_char(existing_query, chosen_char)
+                await send_raw_long_message(query.message, answer)
+            else:
+                context.user_data["group_letter_step"] = "content"
+                context.user_data["group_letter_char_idx"] = choice_idx
+                dear = get_dear(chosen_char)
+                msg = (
+                    f"// Прекрасно, {dear}. Теперь опишите детали группового письма сообщением в чат:\n\n"
+                    "1. Тема письма.\n2. Адресаты (@username).\n3. Особенности для каждого.\n4. Одинаковое или разное."
+                )
+                await query.edit_message_text(msg)
+        return
+
+async def show_event_theme_buttons(query, char, owner_id, custom_title=None):
+    dear = get_dear(char)
+    title_text = custom_title or f"// Какую сферу жизни затронем, {dear}?"
+    buttons = [
+        [InlineKeyboardButton("💌 Отношения и репутация", callback_data=f"ev_theme:rel:{owner_id}"),
+         InlineKeyboardButton("🏛️ Карьера и власть", callback_data=f"ev_theme:car:{owner_id}")],
+        [InlineKeyboardButton("💰 Деньги и векселя", callback_data=f"ev_theme:mon:{owner_id}"),
+         InlineKeyboardButton("🕵️ Тайны и прошлое", callback_data=f"ev_theme:sec:{owner_id}")],
+        [InlineKeyboardButton("🎭 Светский быт и балы", callback_data=f"ev_theme:soc:{owner_id}"),
+         InlineKeyboardButton("🎲 Перст судьбы (Рандом)", callback_data=f"ev_theme:rnd:{owner_id}")],
+        [InlineKeyboardButton("❌ Отмена", callback_data=f"ev_mode:cancel:{owner_id}")]
+    ]
+    await query.edit_message_text(title_text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+
+# ==========================
+# ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ
+# ==========================
+
 async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -1746,6 +2236,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = f"{update.effective_chat.id}:{update.effective_user.id}"
     sender_user_id = update.effective_user.id
     username = update.effective_user.username
+    first_name = update.effective_user.first_name or "Гость"
     lower = text.lower().strip()
     chat_id = update.effective_chat.id
     is_private = update.effective_chat.type == "private"
@@ -1756,6 +2247,171 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if lower.startswith("/start"):
         return
 
+    # ==========================
+    # СБОР РОЛЕВЫХ ПОСТОВ ДЛЯ ДУЭЛЕЙ В БУФЕР (0 ТОКЕНОВ)
+    # ==========================
+    my_uname_tag = "@" + username.lower() if username else ""
+    for d_id, d_data in ACTIVE_DUELS.items():
+        is_p1 = (d_data["p1_id"] == user_id)
+        is_p2 = (my_uname_tag and d_data["p2_uname"] == my_uname_tag)
+        if is_p1 or is_p2:
+            if not text.startswith(("//", "((", "!", "*офф*")) and len(text) >= 15:
+                char_tag = d_data["p1_name"] if is_p1 else "Противник"
+                active_curr = ACTIVE_CHARACTER.get(user_id)
+                if active_curr:
+                    char_tag = active_curr.get("name", char_tag)
+                d_data.setdefault("posts", []).append(f"{char_tag}: {text}")
+
+    # ==========================
+    # КОМАНДА /помощь (/help)
+    # ==========================
+    if lower in ["/помощь", "/help", "катя помощь", "катя, помощь", "катя команды"]:
+        is_admin = sender_user_id in ADMIN_IDS
+        
+        help_text = (
+            "<b>📜 ИМПЕРАТОРСКИЙ СВОД ПРАВИЛ И КОМАНД (1838 ГОД)</b>\n"
+            "ㅤㅤ∴ ════ ∴ ✦ ∴ ════ ∴\n\n"
+            "<b>👤 Персонажи и Анкеты:</b>\n"
+            "• <code>катя новая анкета</code> — подать анкету на регистрацию ко двору.\n"
+            "• <code>/мои_персонажи</code> — меню выбора и переключения активного героя кнопками.\n"
+            "• <code>/анкета</code> — показать вашу текущую анкету со статусами и слухами.\n"
+            "• <code>/изменить_анкету</code> — исправить или дополнить поля анкеты через ИИ.\n"
+            "• <code>/добавить_статус</code> / <code>/удалить_статус</code> — управление статусами героя.\n\n"
+            "<b>💌 Эпистолярная служба:</b>\n"
+            "• <code>/письмо [текст]</code> — составить письмо на изысканном дореформенном слоге с ѣ и ъ.\n"
+            "• <code>/групповое_письмо</code> — рассылка именных посланий сразу нескольким адресатам.\n\n"
+            "<b>⚔️ Честь и Дуэли:</b>\n"
+            "• <code>/дуэль @username</code> — вызвать обидчика к барьеру на Черной речке.\n"
+            "• <code>катя я выиграл дуэль</code> / <code>катя я проиграл дуэль</code> — объявить исход (с выдачей травм по тексту постов!).\n"
+            "• <code>катя дуэль отменена</code> — бескровное примирение чести.\n"
+            "• <code>/статистика</code> — дуэльный послужной список персонажа.\n\n"
+            "<b>💡 Наставления и Этикет:</b>\n"
+            "• <code>/совет [вопрос]</code> — совет по отыгрышу любой сцены, карточной игры или этикета.\n\n"
+            "<b>🎲 Игры судьбы:</b>\n"
+            "• <code>/event</code> (или <code>катя событие</code>) — интерактивное происшествие кнопками.\n\n"
+            "<b>🏢 Предприятия и Лавки столицы:</b>\n"
+            "• <code>/создать_бизнес</code> — внести заведение в реестр Петербурга.\n"
+            "• <code>/закрыть_бизнес</code> — закрыть предприятие кнопками.\n"
+            "• <code>/реестр</code> — список всех заведений столицы.\n"
+            "• <code>/заведение [номер]</code> — изучить меню и ассортимент лавки.\n\n"
+            "<b>📰 «Санкт-Петербургские Ведомости»:</b>\n"
+            "• <code>/редакция [текст]</code> — подать частное объявление в еженедельную газету.\n"
+            "• <code>/архив_газет</code> — исторический архив прошлых номеров.\n\n"
+            "<b>🚨 Прочее:</b>\n"
+            "• <code>/репорт [текст]</code> — отправить весточку разработчику о баге или предложить фичу.\n"
+            "• <code>/правила</code> — ознакомиться с законами и правилами отношений.\n"
+            "• <code>/clear</code> — очистить память текущего диалога с Екатериной."
+        )
+
+        if is_admin:
+            help_text += (
+                "\n\n│────────✤────────│\n"
+                "<b>👑 СЕКРЕТНЫЕ ПОЛНОМОЧИЯ МОДЕРАЦИИ:</b>\n"
+                "• <code>/удалить_анкету @username [номер]</code> — принудительно изъять анкету игрока.\n"
+                "• <code>покажи анкету</code> (в ответ на сообщение) — просмотреть анкеты игрока.\n"
+                "• <code>/дать_достижение [название]</code> (в ответ на сообщение) — наградить ачивкой.\n"
+                "• <code>/дуэль_исход @победитель @проигравший</code> — ручной арбитраж исхода дуэли.\n"
+                "• <code>/дуэль_сброс @ник</code> — экстренно отменить зависшую дуэль.\n"
+                "• <code>/выпуск_газеты</code> — принудительно напечатать и закрепить свежий номер.\n"
+                "• <code>/удалить_газету [номер]</code> — предать огню выпуск из архива.\n"
+                "• <code>/чат_газеты</code> — привязать ролевой чат для авто-публикаций.\n"
+                "• <code>/отношение @ник [директива]</code> — задать секретное отношение Кати к игроку.\n"
+                "• <code>/сбросить_отношение @ник</code> — отменить секретную директиву.\n"
+                "• <code>/директивы</code> — список всех активных директив модерации."
+            )
+
+        await update.message.reply_text(f"<blockquote expandable>{help_text}</blockquote>", parse_mode="HTML")
+        return
+
+    # ==========================
+    # КОМАНДА /репорт (ОТПРАВКА БАГОВ И ПРЕДЛОЖЕНИЙ РАЗРАБОТЧИКУ)
+    # ==========================
+    if lower.startswith("/репорт") or lower.startswith("катя репорт") or lower.startswith("катя, репорт"):
+        report_text = ""
+        if lower.startswith("/репорт"):
+            report_text = text[len("/репорт"):].strip()
+        elif lower.startswith("катя репорт"):
+            report_text = text[len("катя репорт"):].strip(" ,")
+        elif lower.startswith("катя, репорт"):
+            report_text = text[len("катя, репорт"):].strip(" ,")
+
+        if not report_text:
+            await update.message.reply_text("// Укажите суть проблемы или предложение после команды!\n<i>Пример: `/репорт Нашел баг при создании письма`</i>", parse_mode="HTML")
+            return
+
+        sender_uname = f"@{username}" if username else "—"
+        chat_title = update.effective_chat.title or "Личные сообщения"
+        report_payload = (
+            f"🚨 <b>НОВОЕ ДОНЕСЕНИЕ / РЕПОРТ РАЗРАБОТЧИКУ</b>\n"
+            f"ㅤㅤ∴ ════ ∴ ✦ ∴ ════ ∴\n"
+            f"👤 <b>Отправитель:</b> {first_name} ({sender_uname})\n"
+            f"🆔 <b>Telegram ID:</b> <code>{sender_user_id}</code>\n"
+            f"📍 <b>Чат:</b> {chat_title} (<code>{chat_id}</code>)\n"
+            f"│────────✤────────│\n"
+            f"📝 <b>Текст обращения:</b>\n{report_text}"
+        )
+
+        try:
+            await context.bot.send_message(chat_id=REPORT_DEVELOPER_ID, text=report_payload, parse_mode="HTML")
+            await update.message.reply_text("// Ваше донесение запечатано сургучом и доставлено лично в руки разработчику! 📜")
+        except Exception as e:
+            print("Ошибка отправки репорта:", e)
+            await update.message.reply_text("// Не удалось передать донесение вестовыми. Попробуйте чуть позже.")
+        return
+
+    # ==========================
+    # АДМИНСКИЙ АРБИТРАЖ ДУЭЛЕЙ (/дуэль_исход, /дуэль_сброс)
+    # ==========================
+    if lower.startswith("/дуэль_сброс"):
+        if sender_user_id not in ADMIN_IDS:
+            await update.message.reply_text("// Эта команда доступна только секундантам модерации, милая.")
+            return
+        parts = text.split(" ", 1)
+        if len(parts) < 2:
+            ACTIVE_DUELS.clear()
+            await update.message.reply_text("// Все активные дуэли в столице были экстренно прекращены модерацией.")
+            return
+        target_tag = parts[1].strip().lower()
+        removed = False
+        for d_k, d_v in list(ACTIVE_DUELS.items()):
+            if d_v["p2_uname"] == target_tag or target_tag in d_k:
+                ACTIVE_DUELS.pop(d_k, None)
+                removed = True
+        if removed:
+            await update.message.reply_text(f"// Дуэль для <b>{target_tag}</b> успешно сброшена.", parse_mode="HTML")
+        else:
+            await update.message.reply_text("// Активной дуэли для указанного участника не найдено.")
+        return
+
+    if lower.startswith("/дуэль_исход"):
+        if sender_user_id not in ADMIN_IDS:
+            await update.message.reply_text("// Команда доступна только модераторам столицы.")
+            return
+        parts = text.split()
+        if len(parts) < 3:
+            await update.message.reply_text("// Укажите победителя и побежденного! Пример: `/дуэль_исход @победитель @проигравший`", parse_mode="Markdown")
+            return
+        win_uname = parts[1].lower()
+        lose_uname = parts[2].lower()
+        win_uid = USERNAME_CACHE.get(win_uname)
+        lose_uid = USERNAME_CACHE.get(lose_uname)
+
+        if not win_uid or not lose_uid:
+            await update.message.reply_text("// Не удалось найти ID одного из участников в кэше юзернеймов.")
+            return
+
+        end_time_str = datetime.datetime.now().strftime("%H:%M")
+        apply_duel_result(win_uid, "win", lose_uname, "Админ-арбитраж", end_time_str)
+        apply_duel_result(lose_uid, "loss", win_uname, "Админ-арбитраж", end_time_str)
+
+        await update.message.reply_text(
+            f"// ⚔️ <b>Исход дуэли установлен распоряжением модерации!</b>\n"
+            f"Победа присуждена: <b>{win_uname}</b>\n"
+            f"Поражение записано: <b>{lose_uname}</b>",
+            parse_mode="HTML"
+        )
+        return
+
     is_reply = update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id
 
     has_active_state = (
@@ -1763,12 +2419,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         or user_id in WAITING_CHARACTER_UPDATE
         or context.user_data.get("letter_step")
         or context.user_data.get("group_letter_step")
-        or context.user_data.get("event_step")
         or context.user_data.get("biz_step")
-        or context.user_data.get("close_biz_step")
-        or context.user_data.get("admin_sheet_step")
-        or context.user_data.get("pending_status")
-        or context.user_data.get("status_step")
         or context.user_data.get("edit_sheet_step")
         or context.user_data.get("waiting_status_type")
         or context.user_data.get("waiting_status_remove")
@@ -1776,10 +2427,62 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     # ==========================
+    # ИНТЕРАКТИВНЫЕ ИВЕНТЫ (/event)
+    # ==========================
+    if re.search(r"катя,?\s*(сгенерируй\s+)?событие", lower) or lower == "/event":
+        chars = get_characters(user_id)
+        if not chars:
+            await update.message.reply_text("// У вас пока нет сохранённых персонажей, милая. Создайте анкету сначала.")
+            return
+            
+        active_char = ACTIVE_CHARACTER.get(user_id) or chars[0]
+        dear = get_dear(active_char)
+
+        buttons = [
+            [InlineKeyboardButton("👤 Одиночное приключение", callback_data=f"ev_mode:single:{sender_user_id}")],
+            [InlineKeyboardButton("👥 Совместное приключение", callback_data=f"ev_mode:multi:{sender_user_id}")],
+            [InlineKeyboardButton("❌ Отмена", callback_data=f"ev_mode:cancel:{sender_user_id}")]
+        ]
+        await update.message.reply_text(f"// Для кого мы крутим колесо судьбы, {dear}?", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    # ==========================
+    # ВЫБОР ПЕРСОНАЖА КНОПКАМИ (/мои_персонажи)
+    # ==========================
+    if lower in ["катя мои персонажи", "катя, мои персонажи", "катя персонажи", "/мои_персонажи", "/персонажи"]:
+        chars = get_characters(user_id)
+        if not chars:
+            await update.message.reply_text("// У вас пока нет сохранённых персонажей. Создайте анкету командой «катя новая анкета».")
+            return
+        
+        buttons = [[InlineKeyboardButton(f"{i}. {c.get('name', 'Без имени')} ({c.get('title', '—')})", callback_data=f"switch_char:{i-1}:{sender_user_id}")] for i, c in enumerate(chars, 1)]
+        await update.message.reply_text("// Ваши персонажи двора. Нажмите на кнопку, чтобы играть за выбранного:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    # ==========================
+    # ДОБАВЛЕНИЕ СТАТУСА КНОПКАМИ (/добавить_статус)
+    # ==========================
+    if re.search(r"катя,?\s+добавь\s+статус", lower) or lower == "/добавить_статус":
+        buttons = [
+            [InlineKeyboardButton("⏳ Временный статус", callback_data=f"set_status_type:temporary:{sender_user_id}"),
+             InlineKeyboardButton("📌 Постоянный статус", callback_data=f"set_status_type:permanent:{sender_user_id}")],
+            [InlineKeyboardButton("🗣️ Слух в обществе", callback_data=f"set_status_type:rumors:{sender_user_id}"),
+             InlineKeyboardButton("💔 Трагедия", callback_data=f"set_status_type:tragedies:{sender_user_id}")],
+            [InlineKeyboardButton("❌ Отмена", callback_data=f"set_status_type:cancel:{sender_user_id}")]
+        ]
+        await update.message.reply_text("// Какой тип статуса вы желаете добавить в анкету, милая?", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if re.search(r"катя,?\s+удали\s+статус", lower) or lower == "/удалить_статус":
+        context.user_data["waiting_status_remove"] = True
+        await update.message.reply_text("// Укажите точное название статуса, слуха или трагедии, который необходимо убрать из анкеты.")
+        return
+
+    # ==========================
     # СЕКРЕТНЫЕ АДМИН-ДИРЕКТИВЫ ПОВЕДЕНИЯ (/отношение)
     # ==========================
     if lower.startswith("/отношение") or lower.startswith("/указание"):
-        if sender_user_id not in [OWNER_ID, ROLE_OWNER_ID]:
+        if sender_user_id not in ADMIN_IDS:
             await update.message.reply_text("// Эта команда доступна только модераторам столицы, милая.")
             return
         parts = text.split(" ", 2)
@@ -1795,7 +2498,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if lower.startswith("/сбросить_отношение") or lower.startswith("/сбросить_указание"):
-        if sender_user_id not in [OWNER_ID, ROLE_OWNER_ID]:
+        if sender_user_id not in ADMIN_IDS:
             await update.message.reply_text("// Команда доступна только модераторам столицы, милая.")
             return
         parts = text.split(" ", 1)
@@ -1812,7 +2515,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if lower in ["/список_отношений", "/директивы"]:
-        if sender_user_id not in [OWNER_ID, ROLE_OWNER_ID]:
+        if sender_user_id not in ADMIN_IDS:
             await update.message.reply_text("// Команда доступна только модераторам столицы, милая.")
             return
         if not ADMIN_DIRECTIVES:
@@ -1828,7 +2531,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ПРИНУДИТЕЛЬНОЕ УДАЛЕНИЕ АНКЕТ МОДЕРАТОРАМИ (/удалить_анкету)
     # ==========================
     if lower.startswith("/удалить_анкету") or lower.startswith("катя принудительно удали анкету"):
-        if sender_user_id not in [OWNER_ID, ROLE_OWNER_ID, 727703718, 5714213307]:
+        if sender_user_id not in ADMIN_IDS:
             await update.message.reply_text("// Принудительное изъятие анкет доступно только модераторам столицы, милая.")
             return
 
@@ -1885,7 +2588,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ==========================
-    # КОМАНДА /совет (ГЕНЕРАТОР НАСТАВЛЕНИЙ И ЭТИКЕТА)
+    # КОМАНДА /совет (ГЕНЕРАТОР НАСТАВЛЕНИЙ И ЭТИКЕТА) С КНОПКАМИ
     # ==========================
     if lower.startswith("/совет") or lower.startswith("катя совет") or lower.startswith("катя, совет"):
         user_query = ""
@@ -1897,18 +2600,21 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_query = text[len("катя, совет"):].strip(" ,")
 
         if not user_query:
-            quick_menu = (
-                "// <b>💡 Наставник высшего света | По какому поводу требуется совет?</b>\n\n"
-                "Пожалуйста, укажите ваш вопрос после команды! Пример: <code>/совет как отыграть дуэль на шпагах?</code>\n\n"
-                "<b>Или выберите одну из популярных тем для вопроса:</b>\n"
-                "1. ⚔️ <b>Дуэльный этикет</b> (пистолеты, шпаги, правила секундантов)\n"
-                "2. 🃏 <b>Карточные игры</b> (Штосс, Бостон, Вист, правила и азарт)\n"
-                "3. 💃 <b>Балы и салоны</b> (язык веера, мазурка, флирт)\n"
-                "4. 💌 <b>Тайные интриги</b> (шифры, заговор, подкуп слуг)\n"
-                "5. 🎭 <b>Отыгрыш НПС</b> (слуги, кучера, извозчики, городовые)\n"
-                "6. 💰 <b>Векселя и заёмы</b> (ростовщики, долги, залоги)"
+            buttons = [
+                [InlineKeyboardButton("⚔️ Дуэльный этикет", callback_data=f"adv_topic:duel:{sender_user_id}"),
+                 InlineKeyboardButton("🃏 Карты и Штосс", callback_data=f"adv_topic:cards:{sender_user_id}")],
+                [InlineKeyboardButton("💃 Балы и язык веера", callback_data=f"adv_topic:balls:{sender_user_id}"),
+                 InlineKeyboardButton("💌 Тайные интриги", callback_data=f"adv_topic:intrigue:{sender_user_id}")],
+                [InlineKeyboardButton("🎭 Отыгрыш НПС", callback_data=f"adv_topic:npc:{sender_user_id}"),
+                 InlineKeyboardButton("💰 Векселя и залоги", callback_data=f"adv_topic:debts:{sender_user_id}")],
+                [InlineKeyboardButton("❌ Отмена", callback_data=f"ev_mode:cancel:{sender_user_id}")]
+            ]
+            await update.message.reply_text(
+                "// <b>💡 Наставник высшего света | По какому поводу требуется совет?</b>\n"
+                "Выберите интересующую вас тему или задайте вопрос вручную:\n<i>(Пример: <code>/совет как отыграть торг у ростовщика?</code>)</i>",
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode="HTML"
             )
-            await update.message.reply_text(quick_menu, parse_mode="HTML")
             return
 
         chars = get_characters(user_id)
@@ -1928,7 +2634,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ==========================
     # МОДЕРАЦИЯ ЗАЯВОК В ГАЗЕТУ
     # ==========================
-    if is_private and sender_user_id in [OWNER_ID, ROLE_OWNER_ID] and update.message.reply_to_message:
+    if is_private and sender_user_id in ADMIN_IDS and update.message.reply_to_message:
         replied_msg = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
         match_id = re.search(r'ad_\d+_\d+', replied_msg)
         
@@ -1972,7 +2678,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # КОМАНДЫ И ОБРАБОТКА ПОДАЧИ ОБЪЯВЛЕНИЙ В ГАЗЕТУ (/редакция)
     # ==========================
     if lower == "/чат_газеты":
-        if sender_user_id not in [OWNER_ID, ROLE_OWNER_ID]:
+        if sender_user_id not in ADMIN_IDS:
             await update.message.reply_text("// Эта команда доступна только модераторам столицы, милая.")
             return
         g_data = load_gazette_data()
@@ -2071,7 +2777,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if lower in ["/выпуск_газеты", "катя выпуск газеты", "катя, выпуск газеты"]:
-        if sender_user_id not in [OWNER_ID, ROLE_OWNER_ID]:
+        if sender_user_id not in ADMIN_IDS:
             await update.message.reply_text(
                 "// *Императорски смотрит через лорнет* "
                 "Полноте, милая! Верстать и печатать Главную Газету Империи позволено лишь Редакторской Коллегии. "
@@ -2092,7 +2798,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if lower.startswith("/удалить_газету") or lower.startswith("/удалить_выпуск"):
-        if sender_user_id not in [OWNER_ID, ROLE_OWNER_ID]:
+        if sender_user_id not in ADMIN_IDS:
             await update.message.reply_text("// Изъять выпуск из архива могут только владельцы редакции, милая.")
             return
         parts = text.split(" ", 1)
@@ -2156,7 +2862,8 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/чат_газеты", "/редакция", "/одобрить", "/отклонить", "/изменить",
         "/выпуск_газеты", "/архив_газет", "/удалить_газету", "/удалить_выпуск",
         "/отношение", "/указание", "/сбросить_отношение", "/сбросить_указание", "/список_отношений", "/директивы",
-        "/совет", "/удалить_анкету"
+        "/совет", "/удалить_анкету", "/репорт", "/дуэль_исход", "/дуэль_сброс",
+        "/мои_персонажи", "/персонажи", "/помощь", "/help"
     ]
     
     is_command = any(lower.startswith(cmd) for cmd in valid_commands)
@@ -2171,7 +2878,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_creation_request and user_id not in WAITING_CHARACTER:
         chars = get_characters(user_id)
         if not chars:
-            if (is_addressed_to_katya or is_reply or is_private) and sender_user_id not in [727703718, 5714213307]:
+            if (is_addressed_to_katya or is_reply or is_private) and sender_user_id not in ADMIN_IDS:
                 await update.message.reply_text(
                     f"// *Императорски смотрит на вас через лорнет* "
                     f"Полноте, милая! Прежде чем вести со мной беседы или "
@@ -2183,7 +2890,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if user_id not in ACTIVE_CHARACTER or not ACTIVE_CHARACTER[user_id]:
                 ACTIVE_CHARACTER[user_id] = chars[0]
             
-    if sender_user_id in [727703718, 5714213307] and (lower.startswith("/дать_достижение") or lower.startswith("/достижение")):
+    if sender_user_id in ADMIN_IDS and (lower.startswith("/дать_достижение") or lower.startswith("/достижение")):
         if not update.message.reply_to_message:
             await update.message.reply_text("// Ответьте этой командой на сообщение игрока, которому хотите выдать достижение, милая.")
             return
@@ -2211,30 +2918,8 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"// У персонажа уже есть это достижение или произошла ошибка.")
         return
 
-    admin_sheet_step = context.user_data.get("admin_sheet_step")
-    if admin_sheet_step and sender_user_id in [727703718, 5714213307]:
-        if lower in ["отмена", "нет", "отменить", "стоп"]:
-            context.user_data.pop("admin_sheet_step", None)
-            context.user_data.pop("admin_sheet_chars", None)
-            await update.message.reply_text("// Как прикажете, отменяю.")
-            return
-        try:
-            clean_text = re.sub(r'[^\d]', '', text)
-            idx = int(clean_text) - 1
-            chars = context.user_data.get("admin_sheet_chars", [])
-            if 0 <= idx < len(chars):
-                chosen_char = chars[idx]
-                context.user_data.pop("admin_sheet_step", None)
-                context.user_data.pop("admin_sheet_chars", None)
-                await send_long_html(update.message, format_character_sheet(chosen_char))
-            else:
-                await update.message.reply_text("// Нет такого номера в списке. Напишите верный или «отмена».")
-        except ValueError:
-            await update.message.reply_text("// Пожалуйста, укажите цифру.")
-        return
-
     if "покажи его анкету" in lower or "покажи анкету" in lower:
-        if sender_user_id not in [727703718, 5714213307]:
+        if sender_user_id not in ADMIN_IDS:
             insults = [
                 "// *Крутит у виска веером* Какая дерзость! Эта информация строго конфиденциальна.",
                 "// *Выразительно крутит у виска* Полноте, голунчик, вам не положено знать чужие тайны.",
@@ -2260,14 +2945,9 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_long_html(update.message, format_character_sheet(chars[0]))
             return
             
-        msg = f"// У данного господина/дамы несколько персонажей ({len(chars)}):\n\n"
-        for i, c in enumerate(chars, 1):
-            msg += f"{i}. {c.get('name', 'Без имени')}\n"
-        msg += "\n*(Напишите номер анкеты, которую желаете показать, или «отмена»)*"
-        
-        context.user_data["admin_sheet_step"] = True
-        context.user_data["admin_sheet_chars"] = chars
-        await update.message.reply_text(msg)
+        buttons = [[InlineKeyboardButton(f"{i}. {c.get('name', 'Без имени')}", callback_data=f"adm_sheet:{target_user_id_str}:{i-1}:{sender_user_id}")] for i, c in enumerate(chars, 1)]
+        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data=f"ev_mode:cancel:{sender_user_id}")])
+        await update.message.reply_text("// Выберите анкету для проверки:", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     # ==========================
@@ -2325,13 +3005,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"<blockquote expandable>{card}</blockquote>", parse_mode="HTML")
         return
 
-    close_biz_step = context.user_data.get("close_biz_step")
-    if close_biz_step and lower in ["отмена", "нет", "отменить", "стоп"]:
-        context.user_data.pop("close_biz_step", None)
-        context.user_data.pop("close_biz_list", None)
-        await update.message.reply_text("// Закрытие заведения отменено, милая.")
-        return
-
+    # ЗАКРЫТИЕ БИЗНЕСА С КНОПКАМИ
     if text.strip().lower().startswith("/закрыть_бизнес") or lower in ["катя закрыть бизнес", "катя, закрыть бизнес"]:
         user_businesses = [b for b in CITY_BUSINESSES if b.get("owner_user_id") == user_id]
         if not user_businesses:
@@ -2343,45 +3017,13 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("// У вас нет зарегистрированных заведений в столице, которые можно было бы закрыть, милая.")
             return
 
-        if len(user_businesses) == 1:
-            b_to_close = user_businesses[0]
-            CITY_BUSINESSES.remove(b_to_close)
-            save_businesses()
-            await update.message.reply_text(f"// Заведение <b>«{b_to_close.get('name')}»</b> («{b_to_close.get('type')}») было официально закрыто и исключено из реестра Санкт-Петербурга, милая.", parse_mode="HTML")
-            return
-
-        msg = f"// Какое именно из ваших заведений вы желаете закрыть и предать забвению?\n\n"
-        for i, b in enumerate(user_businesses, 1):
-            msg += f"{i}. <b>«{b.get('name')}»</b> ({b.get('type')})\n"
-        msg += "\n*(Напишите номер заведения или «отмена»)*"
-
-        context.user_data["close_biz_step"] = "select"
-        context.user_data["close_biz_list"] = user_businesses
-        await update.message.reply_text(msg, parse_mode="HTML")
+        buttons = [[InlineKeyboardButton(f"🚪 «{b.get('name')}» ({b.get('type')})", callback_data=f"biz_close:{i}:{sender_user_id}")] for i, b in enumerate(user_businesses)]
+        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data=f"ev_mode:cancel:{sender_user_id}")])
+        await update.message.reply_text("// Какое из ваших заведений вы желаете закрыть и вычеркнуть из реестра?", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
-    if close_biz_step == "select":
-        try:
-            clean_text = re.sub(r'[^\d]', '', text)
-            idx = int(clean_text) - 1
-            user_businesses = context.user_data.get("close_biz_list", [])
-            if 0 <= idx < len(user_businesses):
-                b_to_close = user_businesses[idx]
-                CITY_BUSINESSES.remove(b_to_close)
-                save_businesses()
-                
-                context.user_data.pop("close_biz_step", None)
-                context.user_data.pop("close_biz_list", None)
-                
-                await update.message.reply_text(f"// Заведение <b>«{b_to_close.get('name')}»</b> («{b_to_close.get('type')}») было официально закрыто и исключено из реестра Санкт-Петербурга, милая.", parse_mode="HTML")
-            else:
-                await update.message.reply_text("// Нет такого номера в списке. Напишите верный номер или «отмена».")
-        except ValueError:
-            await update.message.reply_text("// Пожалуйста, напишите цифру номера заведения.")
-        return
-
+    # СОЗДАНИЕ БИЗНЕСА С КНОПКАМИ
     biz_step = context.user_data.get("biz_step")
-
     if biz_step and lower in ["отмена", "нет", "отменить", "стоп"]:
         context.user_data.pop("biz_step", None)
         context.user_data.pop("biz_owner", None)
@@ -2400,37 +3042,9 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_char = ACTIVE_CHARACTER.get(user_id) or chars[0]
         dear = get_dear(active_char)
 
-        msg = f"// Кто из ваших персонажей станет владельцем заведения, {dear}?\n\n"
-        for i, c in enumerate(chars, 1):
-            msg += f"{i}. {c.get('name', 'Без имени')}\n"
-        msg += "\n*(Напишите номер персонажа или «отмена»)*"
-
-        context.user_data["biz_step"] = "owner"
-        await update.message.reply_text(msg)
-        return
-
-    if biz_step == "owner":
-        try:
-            clean_text = re.sub(r'[^\d]', '', text)
-            idx = int(clean_text) - 1
-            chars = get_characters(user_id)
-            if 0 <= idx < len(chars):
-                chosen_char = chars[idx]
-                context.user_data["biz_owner"] = chosen_char
-                context.user_data["biz_step"] = "info"
-                await update.message.reply_text(
-                    f"// Прекрасно! Владельцем выбран(а) {chosen_char.get('name')}.\n\n"
-                    f"Укажите через запятую:\n"
-                    f"<b>1. Название заведения</b>\n"
-                    f"<b>2. Тип заведения</b> (трактир, лавка, мастерская, салон и т.д.)\n"
-                    f"<b>3. Статус</b> (старинное родовое гнездо или свежеоткрытое предприятие)\n\n"
-                    f"<i>Пример: Трактир «Веселый Гусаръ», Трактир, Свежеоткрытое предприятие</i>",
-                    parse_mode="HTML"
-                )
-            else:
-                await update.message.reply_text("// Нет такого номера в списке. Укажите верный или «отмена».")
-        except ValueError:
-            await update.message.reply_text("// Напишите номер персонажа цифрой.")
+        buttons = [[InlineKeyboardButton(f"{i}. {c.get('name', 'Без имени')}", callback_data=f"biz_owner:{i-1}:{sender_user_id}")] for i, c in enumerate(chars, 1)]
+        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data=f"ev_mode:cancel:{sender_user_id}")])
+        await update.message.reply_text(f"// Кто из ваших персонажей станет владельцем заведения, {dear}?", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     if biz_step == "info":
@@ -2550,9 +3164,10 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "p1_id": user_id,
             "p1_name": active_char.get("name", "Безымянный"),
             "p2_uname": opp_uname,
-            "start_time": time.time()
+            "start_time": time.time(),
+            "posts": []
         }
-        await update.message.reply_text(f"// Секунданты разошлись по позициям на Черной речке против <b>{opp_uname}</b>, {mily}. Дуэль началась! Любой из вас двоих может сообщить об исходе («катя я выиграл дуэль» / «катя я проиграл дуэль») или отменить вызов («катя дуэль отменена»). ⚔️", parse_mode="HTML")
+        await update.message.reply_text(f"// Секунданты разошлись по позициям на Черной речке против <b>{opp_uname}</b>, {mily}. Дуэль началась! Пишите свои посты — Екатерина лично следит за поединком. В конце сообщите об исходе («катя я выиграл дуэль» / «катя я проиграл дуэль») или отмените вызов («катя дуэль отменена»). ⚔️", parse_mode="HTML")
         return
 
     if lower in ["катя дуэль отменена", "катя, дуэль отменена", "катя я выйграл дуэль", "катя я выиграл дуэль", "катя, я выйграл дуэль", "катя, я выиграл дуэль", "катя я проиграл дуэль", "катя, я проиграл дуэль"]:
@@ -2579,6 +3194,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p1_id = d["p1_id"]
         p1_name = d["p1_name"]
         p2_uname = d["p2_uname"]
+        duel_posts = d.get("posts", [])
         p2_id = USERNAME_CACHE.get(p2_uname)
         
         duration = get_status_duration(d["start_time"])
@@ -2604,23 +3220,60 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if is_initiator:
                 p1_res, p2_res = "win", "loss"
                 winner_name, loser_name = p1_name, p2_name
+                loser_uid = p2_id
             else:
                 p1_res, p2_res = "loss", "win"
                 winner_name, loser_name = p2_name, p1_name
+                loser_uid = p1_id
         else:
             if is_initiator:
                 p1_res, p2_res = "loss", "win"
                 winner_name, loser_name = p2_name, p1_name
+                loser_uid = p1_id
             else:
                 p1_res, p2_res = "win", "loss"
                 winner_name, loser_name = p1_name, p2_name
+                loser_uid = p2_id
 
         ach1 = apply_duel_result(p1_id, p1_res, p2_name, duration, end_time_str)
         ach2 = []
         if p2_id:
             ach2 = apply_duel_result(p2_id, p2_res, p1_name, duration, end_time_str)
+
+        working_msg = await update.message.reply_text("// Лейб-медики спешат к барьеру, Екатерина выносит дуэльный вердикт... 🩸")
+        verdict_text, injury_name = await generate_duel_verdict_and_injury(winner_name, loser_name, duel_posts)
+        
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=working_msg.message_id)
+        except Exception:
+            pass
+
+        if loser_uid:
+            l_chars = get_characters(loser_uid)
+            if l_chars:
+                from characters import load_characters as lc_db
+                db = lc_db()
+                active_idx = db.get(loser_uid + "_active", 0)
+                if active_idx >= len(l_chars):
+                    active_idx = 0
+                loser_char = l_chars[active_idx]
+                if "changes" not in loser_char: loser_char["changes"] = {"permanent": [], "temporary": [], "achievements": [], "tragedies": [], "rumors": []}
+                if "status_times" not in loser_char: loser_char["status_times"] = {}
+                
+                loser_char["changes"]["temporary"].append(injury_name)
+                loser_char["status_times"][injury_name] = time.time()
+                l_chars[active_idx] = loser_char
+                save_characters(loser_uid, l_chars)
+                ACTIVE_CHARACTER[loser_uid] = loser_char
             
-        msg = f"// ⚔️ <b>Дуэль завершена!</b>\nТриумфальная победа достается: <b>{winner_name}</b>!\n<b>{loser_name}</b> получает ранение и горечь поражения. Петербургский свет уже гудит об этом!"
+        msg = (
+            f"⚔️ <b>ДУЭЛЬНЫЙ ВЕРДИКТ ЕЕ ВЕЛИЧЕСТВА</b>\n"
+            f"ㅤㅤ∴ ════ ∴ ✦ ∴ ════ ∴\n"
+            f"🏆 <b>Триумфатор:</b> {winner_name}\n"
+            f"🩸 <b>Побежденный:</b> {loser_name}\n\n"
+            f"<blockquote expandable>{verdict_text}</blockquote>\n\n"
+            f"🩹 <b>Получен статус травмы:</b> «{injury_name}» (записан в анкету {loser_name})"
+        )
         await update.message.reply_text(msg, parse_mode="HTML")
         
         if ach1 and is_initiator:
@@ -2629,68 +3282,119 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"// ✨ За дуэльные интриги вы получаете достижение: <b>{', '.join(ach2)}</b>!", parse_mode="HTML")
         return
 
-    # ==========================
-    # РУЧНОЕ УПРАВЛЕНИЕ СТАТУСАМИ И СЛУХАМИ
-    # ==========================
-    status_step = context.user_data.get("status_step")
-    if status_step and lower in ["отмена", "нет", "отменить", "стоп"]:
-        context.user_data.pop("status_step", None)
-        await update.message.reply_text("// Как скажешь, милая. Отменяю изменение статусов.")
-        return
+    # Ввод текста для выбранного типа статуса
+    waiting_status_type = context.user_data.get("waiting_status_type")
+    if waiting_status_type:
+        context.user_data.pop("waiting_status_type", None)
+        char = ACTIVE_CHARACTER.get(user_id)
+        if not char:
+            await update.message.reply_text("// Сначала выберите активного персонажа.")
+            return
+        st_text = text.strip(" '\"«»")
+        
+        success = False
+        if st_text:
+            clean_expired_statuses_and_rumors(char)
+            st_cat = normalize_status_category(waiting_status_type)
+                
+            if st_text not in char["changes"].get(st_cat, []):
+                if st_cat not in char["changes"]:
+                    char["changes"][st_cat] = []
+                char["changes"][st_cat].append(st_text)
+                
+                if st_cat in ["temporary", "rumors"]:
+                    char.setdefault("status_times", {})[st_text] = time.time()
+                elif st_cat == "achievements":
+                    char.setdefault("achievement_times", {})[st_text] = time.time()
+                    
+                clean_expired_statuses_and_rumors(char)
+                all_chars = get_characters(user_id)
+                from characters import load_characters as lc_db
+                db = lc_db()
+                active_idx = db.get(user_id + "_active", 0)
+                if active_idx < len(all_chars):
+                    all_chars[active_idx] = char
+                else:
+                    for i, c in enumerate(all_chars):
+                        if c.get("name") == char.get("name"):
+                            all_chars[i] = char
+                            break
+                save_characters(user_id, all_chars)
+                ACTIVE_CHARACTER[user_id] = char
+                success = True
 
-    if status_step == "choose_type":
-        choice = text.strip()
-        types_map = {"1": "temporary", "2": "permanent", "3": "rumors", "4": "tragedies"}
-        if choice in types_map:
-            st_type = types_map[choice]
-            context.user_data.pop("status_step", None)
-            context.user_data["waiting_status_type"] = st_type
-            
-            names_map = {
-                "temporary": "временный статус",
-                "permanent": "постоянный статус",
-                "rumors": "слух",
-                "tragedies": "трагедию"
-            }
-            await update.message.reply_text(f"// Напишите текст, который нужно записать как {names_map[st_type]}.")
+        if success:
+            curr_char = ACTIVE_CHARACTER[user_id]
+            unlocked = check_character_achievements(user_id, curr_char, "status_added", 1)
+            await update.message.reply_text(f"// Статус успешно добавлен в анкету: {st_text}")
+            if unlocked:
+                await update.message.reply_text(f"// ✨ За бурные светские перемены персонаж получает тайное достижение: <b>{', '.join(unlocked)}</b>!", parse_mode="HTML")
         else:
-            await update.message.reply_text("// Пожалуйста, напишите цифру от 1 до 4 или «отмена».")
+            await update.message.reply_text("// Не удалось добавить статус. Вероятно, он уже существует.")
         return
 
-    if re.search(r"катя,?\s+добавь\s+(временный\s+статус|постоянный\s+статус|слух|трагедию)", lower):
-        if "временный" in lower:
-            st_type = "temporary"
-            prompt_name = "временный статус"
-        elif "постоянный" in lower:
-            st_type = "permanent"
-            prompt_name = "постоянный статус"
-        elif "слух" in lower:
-            st_type = "rumors"
-            prompt_name = "слух"
-        else:
-            st_type = "tragedies"
-            prompt_name = "трагедию"
+    if context.user_data.get("waiting_status_remove"):
+        context.user_data.pop("waiting_status_remove", None)
+        st_text = text.strip(" '\"«»")
+        char = ACTIVE_CHARACTER.get(user_id)
+        if not char:
+            await update.message.reply_text("// Активный персонаж не выбран.")
+            return
             
-        context.user_data["waiting_status_type"] = st_type
-        await update.message.reply_text(f"// Какой {prompt_name} записать в вашу анкету, милая? Напишите его текст.")
+        found = False
+        for cat in ["temporary", "permanent", "achievements", "tragedies", "rumors"]:
+            if cat in char.get("changes", {}) and st_text in char["changes"][cat]:
+                char["changes"][cat].remove(st_text)
+                clean_expired_statuses_and_rumors(char)
+                all_chars = get_characters(user_id)
+                from characters import load_characters as lc_db
+                db = lc_db()
+                active_idx = db.get(user_id + "_active", 0)
+                if active_idx < len(all_chars):
+                    all_chars[active_idx] = char
+                else:
+                    for i, c in enumerate(all_chars):
+                        if c.get("name") == char.get("name"):
+                            all_chars[i] = char
+                            break
+                save_characters(user_id, all_chars)
+                ACTIVE_CHARACTER[user_id] = char
+                found = True
+                await update.message.reply_text(f"// Статус «{st_text}» успешно убран из анкеты, милая.")
+                break
+                
+        if not found:
+            await update.message.reply_text(f"// Я не нашла статус «{st_text}» в анкете. Проверь точное название.")
         return
 
-    if re.search(r"катя,?\s+добавь\s+статус", lower) or lower == "/добавить_статус":
-        msg = (
-            "// Какой тип статуса вы желаете добавить в анкету, милая?\n\n"
-            "1. ⏳ Временный статус\n"
-            "2. 📌 Постоянный статус\n"
-            "3. 🗣️ Слух в обществе\n"
-            "4. 💔 Трагедия\n\n"
-            "*(Напишите цифру от 1 до 4 или «отмена»)*"
-        )
-        context.user_data["status_step"] = "choose_type"
-        await update.message.reply_text(msg)
+    match = re.search(r"катя,?\s+выбери персонажа\s+(\d+)", lower)
+    if match:
+        idx = int(match.group(1)) - 1
+        if set_active_character_local(user_id, idx):
+            curr_char = ACTIVE_CHARACTER[user_id]
+            unlocked = check_character_achievements(user_id, curr_char, "character_switches", 1)
+            await update.message.reply_text(
+                "// Хорошо. Теперь играем за:\n\n" + format_character_sheet(curr_char),
+                parse_mode="HTML"
+            )
+            if unlocked:
+                await update.message.reply_text(f"// ✨ За смену масок персонаж получает достижение: <b>{', '.join(unlocked)}</b>!", parse_mode="HTML")
+        else:
+            await update.message.reply_text("// Такого персонажа нет.")
         return
 
-    if re.search(r"катя,?\s+удали\s+статус", lower) or lower == "/удалить_статус":
-        context.user_data["waiting_status_remove"] = True
-        await update.message.reply_text("// Укажите точное название статуса, слуха или трагедии, который необходимо убрать из анкеты.")
+    match_del = re.search(r"катя,?\s+удали персонажа\s+(\d+)", lower)
+    if match_del:
+        idx = int(match_del.group(1)) - 1
+        chars = get_characters(user_id)
+        if 0 <= idx < len(chars):
+            rem = chars[idx]
+            remove_character(user_id, idx)
+            if ACTIVE_CHARACTER.get(user_id, {}).get("name") == rem.get("name"):
+                ACTIVE_CHARACTER.pop(user_id, None)
+            await update.message.reply_text(f"// Персонаж «{rem.get('name', 'Без имени')}» удален.")
+        else:
+            await update.message.reply_text("// Неверный номер персонажа.")
         return
 
     # ==========================
@@ -2837,884 +3541,115 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ==========================
-    # Одиночные письма
+    # Одиночные письма (С КНОПКАМИ ВЫБОРА АВТОРА)
     # ==========================
     letter_step = context.user_data.get("letter_step")
-    
     if letter_step and lower in ["отмена", "нет", "отменить", "стоп"]:
-        prompt_id = context.user_data.pop("letter_prompt_msg_id", None)
-        if prompt_id:
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=prompt_id)
-            except Exception:
-                pass
         context.user_data.pop("letter_step", None)
-        context.user_data.pop("letter_char_idx", None)
         context.user_data.pop("letter_query", None)
-        await update.message.reply_text("// Как скажешь, милая. Отменяю составление письма.")
-        return
-
-    if letter_step == "character":
-        try:
-            clean_text = re.sub(r'[^\d]', '', text)
-            if not clean_text:
-                await update.message.reply_text("// Пожалуйста, напишите номер из списка цифрой.")
-                return
-            idx = int(clean_text) - 1
-            chars = get_characters(user_id)
-            npc_option_num = len(chars)
-
-            if idx == npc_option_num:
-                prompt_msg_id = context.user_data.get("letter_prompt_msg_id")
-                try:
-                    if prompt_msg_id: await context.bot.delete_message(chat_id=chat_id, message_id=prompt_msg_id)
-                    await update.message.delete()
-                except Exception:
-                    pass
-                    
-                context.user_data["letter_step"] = "npc_details"
-                msg_obj = await context.bot.send_message(
-                    chat_id=chat_id, 
-                    text="// 🎭 От какого именно НПС пишем письмо?\nНапишите его имя, титул или краткое описание."
-                )
-                context.user_data["letter_prompt_msg_id"] = msg_obj.message_id
-                return
-
-            elif 0 <= idx < len(chars):
-                chosen_char = chars[idx]
-                letter_query = context.user_data.get("letter_query", "")
-                prompt_msg_id = context.user_data.get("letter_prompt_msg_id")
-                user_msg_id = update.message.message_id
-                
-                context.user_data.pop("letter_step", None)
-                context.user_data.pop("letter_char_idx", None)
-                context.user_data.pop("letter_query", None)
-                context.user_data.pop("letter_prompt_msg_id", None)
-                
-                mily = get_mily(chosen_char)
-                working_msg = await update.message.reply_text(f"// Перо скрипит по бумаге, {mily}, составляю послание от лица вашего персонажа... ✍️")
-                working_msg_id = working_msg.message_id
-                
-                answer = await rewrite_letter_command_with_char(letter_query, chosen_char)
-                unlocked = check_character_achievements(user_id, chosen_char, "letters_written", 1)
-                
-                for m_id in [prompt_msg_id, working_msg_id, user_msg_id]:
-                    if m_id:
-                        try:
-                            await context.bot.delete_message(chat_id=chat_id, message_id=m_id)
-                        except Exception:
-                            pass
-
-                if not answer or answer.startswith("// Ох"):
-                    await context.bot.send_message(chat_id=chat_id, text=f"// Простите, {get_dear(chosen_char)}, чернильница опрокинулась, и письмо не сошлось строчками.")
-                else:
-                    await context.bot.send_message(chat_id=chat_id, text=answer, parse_mode="HTML")
-                    if unlocked:
-                        await context.bot.send_message(chat_id=chat_id, text=f"// ✨ За ваши труды персонаж получает тайное достижение: <b>{', '.join(unlocked)}</b>!", parse_mode="HTML")
-            else:
-                await update.message.reply_text("// Такого номера нет в списке. Напиши верный номер или «отмена».")
-        except ValueError:
-            await update.message.reply_text("// Пожалуйста, напиши просто цифру номера персонажа.")
+        await update.message.reply_text("// Составление письма отменено, милая.")
         return
 
     if letter_step == "npc_details":
         npc_info = text.strip()
-        prompt_msg_id = context.user_data.get("letter_prompt_msg_id")
-        user_msg_id = update.message.message_id
-        letter_query = context.user_data.get("letter_query", "")
-        
+        letter_query = context.user_data.pop("letter_query", "")
         context.user_data.pop("letter_step", None)
-        context.user_data.pop("letter_query", None)
-        context.user_data.pop("letter_prompt_msg_id", None)
         
-        npc_char = {
-            "name": npc_info,
-            "title": "НПС",
-            "estate": "НПС",
-            "gender": "—",
-            "age": "—",
-            "personality": f"НПС: {npc_info}",
-            "history": f"НПС: {npc_info}"
-        }
+        npc_char = {"name": npc_info, "title": "НПС", "estate": "НПС", "gender": "—", "age": "—", "personality": f"НПС: {npc_info}", "history": f"НПС: {npc_info}"}
         
         working_msg = await update.message.reply_text(f"// Перо скрипит по бумаге, составляю послание от лица НПС ({npc_info})... ✍️")
-        working_msg_id = working_msg.message_id
-        
         answer = await rewrite_letter_command_with_char(letter_query, npc_char)
         
-        for m_id in [prompt_msg_id, working_msg_id, user_msg_id]:
-            if m_id:
-                try:
-                    await context.bot.delete_message(chat_id=chat_id, message_id=m_id)
-                except Exception:
-                    pass
+        try: await context.bot.delete_message(chat_id=chat_id, message_id=working_msg.message_id)
+        except Exception: pass
 
         if not answer or answer.startswith("// Ох"):
-            await context.bot.send_message(chat_id=chat_id, text="// Простите, чернильница опрокинулась, и письмо от лица НПС не сошлось строчками.")
+            await context.bot.send_message(chat_id=chat_id, text="// Простите, чернильница опрокинулась, письмо от лица НПС не сошлось строчками.")
         else:
             await context.bot.send_message(chat_id=chat_id, text=answer, parse_mode="HTML")
         return
 
     if text.strip().lower().startswith("/письмо"):
         letter_query = text.strip()[len("/письмо"):].strip()
-        
         try:
-            if update.message:
-                 await update.message.delete()
-        except Exception:
-            pass 
+            if update.message: await update.message.delete()
+        except Exception: pass
 
         chars = get_characters(user_id)
-        msg = "// Кто пишет это послание?\n\n"
-        for i, c in enumerate(chars, 1):
-            msg += f"{i}. {c.get('name', 'Без имени')}\n"
-            
-        npc_num = len(chars) + 1
-        msg += f"{npc_num}. 🎭 Написать от лица НПС (Укажите имя и детали НПС)\n"
-        msg += "\n*(Напишите номер выбора или «отмена»)*"
-
-        context.user_data["letter_step"] = "character"
         context.user_data["letter_query"] = letter_query
-        
-        msg_obj = await context.bot.send_message(chat_id=chat_id, text=msg)
-        context.user_data["letter_prompt_msg_id"] = msg_obj.message_id
+
+        buttons = [[InlineKeyboardButton(f"{i}. {c.get('name', 'Без имени')}", callback_data=f"let_char:{i-1}:{sender_user_id}")] for i, c in enumerate(chars, 1)]
+        buttons.append([InlineKeyboardButton("🎭 Написать от лица НПС", callback_data=f"let_char:{len(chars)}:{sender_user_id}")])
+        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data=f"ev_mode:cancel:{sender_user_id}")])
+
+        await context.bot.send_message(chat_id=chat_id, text="// Кто пишет это послание?", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     # ==========================
-    # Групповые письма
+    # Групповые письма (С КНОПКАМИ)
     # ==========================
     group_letter_step = context.user_data.get("group_letter_step")
-
     if group_letter_step and lower in ["отмена", "нет", "отменить", "стоп"]:
-        prompt_id = context.user_data.pop("group_letter_prompt_msg_id", None)
-        if prompt_id:
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=prompt_id)
-            except Exception:
-                pass
         context.user_data.pop("group_letter_step", None)
         context.user_data.pop("group_letter_char_idx", None)
         context.user_data.pop("group_letter_npc_char", None)
         context.user_data.pop("group_letter_query", None)
-        await update.message.reply_text("// Как скажешь, милая. Отменяю составление группового письма.")
-        return
-
-    if group_letter_step == "character":
-        try:
-            clean_text = re.sub(r'[^\d]', '', text)
-            if not clean_text:
-                await update.message.reply_text("// Пожалуйста, напишите номер из списка цифрой.")
-                return
-            idx = int(clean_text) - 1
-            chars = get_characters(user_id)
-            npc_num = len(chars)
-
-            if idx == npc_num:
-                prompt_msg_id = context.user_data.get("group_letter_prompt_msg_id")
-                try:
-                    if prompt_msg_id: await context.bot.delete_message(chat_id=chat_id, message_id=prompt_msg_id)
-                    await update.message.delete()
-                except Exception:
-                    pass
-
-                context.user_data["group_letter_step"] = "npc_details"
-                msg_obj = await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="// 🎭 От какого именно НПС пишем групповые письма?\nНапишите его имя, титул или краткое описание."
-                )
-                context.user_data["group_letter_prompt_msg_id"] = msg_obj.message_id
-                return
-
-            elif 0 <= idx < len(chars):
-                chosen_char = chars[idx]
-                prompt_msg_id = context.user_data.get("group_letter_prompt_msg_id")
-                user_msg_id = update.message.message_id
-                existing_query = context.user_data.get("group_letter_query", "").strip()
-
-                if existing_query:
-                    context.user_data.pop("group_letter_step", None)
-                    context.user_data.pop("group_letter_char_idx", None)
-                    context.user_data.pop("group_letter_query", None)
-                    context.user_data.pop("group_letter_prompt_msg_id", None)
-
-                    mily = get_mily(chosen_char)
-                    working_msg = await update.message.reply_text(f"// Перо быстро скользит по пергаменту, {mily}, составляю групповые послания... ✍️")
-                    working_msg_id = working_msg.message_id
-
-                    answer = await generate_group_letters_command_with_char(existing_query, chosen_char)
-                    
-                    unlocked_g = check_character_achievements(user_id, chosen_char, "group_letters_sent", 1)
-                    unlocked_l = check_character_achievements(user_id, chosen_char, "letters_written", 1)
-                    all_unlocked = list(set(unlocked_g + unlocked_l))
-
-                    for m_id in [prompt_msg_id, working_msg_id, user_msg_id]:
-                        if m_id:
-                            try:
-                                await context.bot.delete_message(chat_id=chat_id, message_id=m_id)
-                            except Exception:
-                                pass
-
-                    if not answer or answer.startswith("// Охъ"):
-                        await context.bot.send_message(chat_id=chat_id, text=f"// Простите, {get_dear(chosen_char)}, чернильница опрокинулась, письма не сошлись строчками.")
-                    else:
-                        await send_raw_long_message(update.message, answer)
-                        if all_unlocked:
-                            await context.bot.send_message(chat_id=chat_id, text=f"// ✨ За широкие светские интриги персонаж получает тайное достижение: <b>{', '.join(all_unlocked)}</b>!", parse_mode="HTML")
-                else:
-                    context.user_data["group_letter_step"] = "content"
-                    context.user_data["group_letter_char_idx"] = idx
-
-                    dear = get_dear(chosen_char)
-                    msg = (
-                        f"// Прекрасно, {dear}. Теперь опишите детали группового письма:\n\n"
-                        "1. Укажите **тему письма**.\n"
-                        "2. Перечислите **адресатов** (их имена и Telegram-username).\n"
-                        "3. Укажите особенности для каждого.\n"
-                        "4. Уточните: отправить **всем одинаковое** письмо или **для каждого разное**.\n\n"
-                        "*(Напишите всё одним сообщением или отправьте «отмена»)*"
-                    )
-                    
-                    if prompt_msg_id:
-                        try:
-                            await context.bot.delete_message(chat_id=chat_id, message_id=prompt_msg_id)
-                        except Exception:
-                            pass
-
-                    msg_obj = await update.message.reply_text(msg)
-                    context.user_data["group_letter_prompt_msg_id"] = msg_obj.message_id
-                    
-                    try:
-                        await context.bot.delete_message(chat_id=chat_id, message_id=user_msg_id)
-                    except Exception:
-                        pass
-            else:
-                await update.message.reply_text("// Такого номера нет в списке. Напиши верный номер или «отмена».")
-        except ValueError:
-            await update.message.reply_text("// Пожалуйста, напиши просто цифру номера персонажа.")
+        await update.message.reply_text("// Составление группового письма отменено.")
         return
 
     if group_letter_step == "npc_details":
         npc_info = text.strip()
-        prompt_msg_id = context.user_data.get("group_letter_prompt_msg_id")
-        user_msg_id = update.message.message_id
         existing_query = context.user_data.get("group_letter_query", "").strip()
-
-        npc_char = {
-            "name": npc_info,
-            "title": "НПС",
-            "estate": "НПС",
-            "gender": "—",
-            "age": "—",
-            "personality": f"НПС: {npc_info}",
-            "history": f"НПС: {npc_info}"
-        }
+        npc_char = {"name": npc_info, "title": "НПС", "estate": "НПС", "gender": "—", "age": "—", "personality": f"НПС: {npc_info}", "history": f"НПС: {npc_info}"}
 
         if existing_query:
             context.user_data.pop("group_letter_step", None)
             context.user_data.pop("group_letter_query", None)
-            context.user_data.pop("group_letter_prompt_msg_id", None)
-
-            working_msg = await update.message.reply_text(f"// Перо быстро скользит по пергаменту, составляю групповые послания от НПС ({npc_info})... ✍️")
-            working_msg_id = working_msg.message_id
-
+            working_msg = await update.message.reply_text(f"// Составляю групповые послания от НПС ({npc_info})... ✍️")
             answer = await generate_group_letters_command_with_char(existing_query, npc_char)
-
-            for m_id in [prompt_msg_id, working_msg_id, user_msg_id]:
-                if m_id:
-                    try:
-                        await context.bot.delete_message(chat_id=chat_id, message_id=m_id)
-                    except Exception:
-                        pass
-
-            if not answer or answer.startswith("// Охъ"):
-                await context.bot.send_message(chat_id=chat_id, text="// Простите, чернильница опрокинулась, письма от НПС не сошлись строчками.")
-            else:
-                await send_raw_long_message(update.message, answer)
+            try: await context.bot.delete_message(chat_id=chat_id, message_id=working_msg.message_id)
+            except Exception: pass
+            await send_raw_long_message(update.message, answer)
         else:
             context.user_data["group_letter_step"] = "content"
             context.user_data["group_letter_npc_char"] = npc_char
-
-            msg = (
-                f"// Прекрасно! Пишем от лица НПС ({npc_info}). Теперь опишите детали группового письма:\n\n"
-                "1. Укажите **тему письма**.\n"
-                "2. Перечислите **адресатов** (их имена и Telegram-username).\n"
-                "3. Укажите особенности для каждого.\n"
-                "4. Уточните: отправить **всем одинаковое** письмо или **для каждого разное**.\n\n"
-                "*(Напишите всё одним сообщением или отправьте «отмена»)*"
-            )
-
-            if prompt_msg_id:
-                try: await context.bot.delete_message(chat_id=chat_id, message_id=prompt_msg_id)
-                except Exception: pass
-
-            msg_obj = await update.message.reply_text(msg)
-            context.user_data["group_letter_prompt_msg_id"] = msg_obj.message_id
-
-            try: await context.bot.delete_message(chat_id=chat_id, message_id=user_msg_id)
-            except Exception: pass
+            msg = f"// Прекрасно! Пишем от лица НПС ({npc_info}). Теперь опишите тему, адресатов и особенности одним сообщением:"
+            await update.message.reply_text(msg)
         return
 
     if group_letter_step == "content":
         idx = context.user_data.get("group_letter_char_idx", 0)
-        npc_char = context.user_data.get("group_letter_npc_char")
-        
-        if npc_char:
-            chosen_char = npc_char
+        npc_char = context.user_data.pop("group_letter_npc_char", None)
+        context.user_data.pop("group_letter_step", None)
+        context.user_data.pop("group_letter_char_idx", None)
+
+        if npc_char: chosen_char = npc_char
         else:
             chars = get_characters(user_id)
             chosen_char = chars[idx] if 0 <= idx < len(chars) else None
 
-        prompt_msg_id = context.user_data.get("group_letter_prompt_msg_id")
-        user_msg_id = update.message.message_id
-        query_text = text
+        working_msg = await update.message.reply_text(f"// Составляю групповые послания... ✍️")
+        answer = await generate_group_letters_command_with_char(text, chosen_char)
+        try: await context.bot.delete_message(chat_id=chat_id, message_id=working_msg.message_id)
+        except Exception: pass
 
-        context.user_data.pop("group_letter_step", None)
-        context.user_data.pop("group_letter_char_idx", None)
-        context.user_data.pop("group_letter_npc_char", None)
-        context.user_data.pop("group_letter_prompt_msg_id", None)
-
-        char_title_name = chosen_char.get('name', 'автора')
-        working_msg = await update.message.reply_text(f"// Перо быстро скользит по пергаменту, составляю групповые послания от лица {char_title_name}... ✍️")
-        working_msg_id = working_msg.message_id
-
-        answer = await generate_group_letters_command_with_char(query_text, chosen_char)
-        
-        unlocked = []
-        if not npc_char:
-            unlocked_g = check_character_achievements(user_id, chosen_char, "group_letters_sent", 1)
-            unlocked_l = check_character_achievements(user_id, chosen_char, "letters_written", 1)
-            unlocked = list(set(unlocked_g + unlocked_l))
-
-        for m_id in [prompt_msg_id, working_msg_id, user_msg_id]:
-            if m_id:
-                try: await context.bot.delete_message(chat_id=chat_id, message_id=m_id)
-                except Exception: pass
-
-        if not answer or answer.startswith("// Охъ"):
-            await context.bot.send_message(chat_id=chat_id, text="// Простите, чернильница опрокинулась, письма не сошлись строчками.")
-        else:
-            await send_raw_long_message(update.message, answer)
-            if unlocked:
-                await context.bot.send_message(chat_id=chat_id, text=f"// ✨ За широкие светские интриги персонаж получает тайное достижение: <b>{', '.join(unlocked)}</b>!", parse_mode="HTML")
+        await send_raw_long_message(update.message, answer)
         return
 
     if text.strip().lower().startswith("/групповое_письмо") or text.strip().lower().startswith("/гписьмо"):
         group_query = text.strip().split(" ", 1)[1] if " " in text.strip() else ""
-
         try:
-              if update.message:
-                 await update.message.delete()
-        except Exception as e:
-            print("Не удалось удалить сообщение пользователя:", e)
+            if update.message: await update.message.delete()
+        except Exception: pass
 
         chars = get_characters(user_id)
-        msg = "// Кто пишет эти групповые послания?\n\n"
-        for i, c in enumerate(chars, 1):
-            msg += f"{i}. {c.get('name', 'Без имени')}\n"
-            
-        npc_num = len(chars) + 1
-        msg += f"{npc_num}. 🎭 Написать от лица НПС (Укажите имя и детали НПС)\n"
-        msg += "\n*(Напишите номер выбора или «отмена»)*"
-
-        context.user_data["group_letter_step"] = "character"
         context.user_data["group_letter_query"] = group_query
-        
-        msg_obj = await context.bot.send_message(chat_id=chat_id, text=msg)
-        context.user_data["group_letter_prompt_msg_id"] = msg_obj.message_id
-        return
 
-    # ==========================
-    # ИНТЕРАКТИВНОЕ СОБЫТИЕ (STATE MACHINE)
-    # ==========================
-    event_step = context.user_data.get("event_step")
-    
-    if event_step and lower in ["отмена", "нет", "отменить", "стоп"]:
-        context.user_data.pop("event_step", None)
-        context.user_data.pop("event_mode", None)
-        context.user_data.pop("event_participants", None)
-        context.user_data.pop("chat_active_chars", None)
-        await update.message.reply_text("// Как скажешь, милая. Отменяю создание события.")
-        return
+        buttons = [[InlineKeyboardButton(f"{i}. {c.get('name', 'Без имени')}", callback_data=f"glet_char:{i-1}:{sender_user_id}")] for i, c in enumerate(chars, 1)]
+        buttons.append([InlineKeyboardButton("🎭 Написать от лица НПС", callback_data=f"glet_char:{len(chars)}:{sender_user_id}")])
+        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data=f"ev_mode:cancel:{sender_user_id}")])
 
-    if re.search(r"катя,?\s*(сгенерируй\s+)?событие", lower) or lower == "/event":
-        chars = get_characters(user_id)
-        if not chars:
-            await update.message.reply_text("// У вас пока нет сохранённых персонажей, милая. Создайте анкету сначала.")
-            return
-            
-        active_char = ACTIVE_CHARACTER.get(user_id) or chars[0]
-        dear = get_dear(active_char)
-
-        msg = (
-            f"// Для кого мы крутим колесо судьбы, {dear}?\n\n"
-            f"1. 👤 Одиночное приключение (для одного вашего персонажа)\n"
-            f"2. 👥 Совместное приключение (для нескольких игроков этого чата)\n\n"
-            f"*(Напишите цифру 1 или 2, либо «отмена»)*"
-        )
-        context.user_data["event_step"] = "select_mode"
-        await update.message.reply_text(msg)
-        return
-
-    if event_step == "select_mode":
-        choice = text.strip()
-        my_chars = get_characters(user_id)
-        my_active = ACTIVE_CHARACTER.get(user_id) or my_chars[0]
-        
-        if choice == "1":
-            context.user_data["event_mode"] = "single"
-            msg = f"// Кто из ваших персонажей отправится в приключение?\n\n"
-            for i, c in enumerate(my_chars, 1):
-                msg += f"{i}. {c.get('name', 'Без имени')}\n"
-            msg += "\n*(Напишите номер персонажа или «отмена»)*"
-            context.user_data["event_step"] = "select_char_single"
-            await update.message.reply_text(msg)
-            
-        elif choice == "2":
-            context.user_data["event_mode"] = "multi"
-            msg = (
-                f"// Как мы выберем спутников для приключения, {get_mily(my_active)}?\n\n"
-                f"1. ✍️ Выбрать вручную из списка активных персонажей этого чата\n"
-                f"2. 🎲 Перст судьбы (Я выберу случайных компаньонов сама)\n\n"
-                f"*(Напишите цифру 1 или 2, либо «отмена»)*"
-            )
-            context.user_data["event_step"] = "select_multi_mode"
-            await update.message.reply_text(msg)
-        else:
-            await update.message.reply_text("// Пожалуйста, напишите цифру 1 или 2, либо «отмена».")
-        return
-
-    if event_step == "select_char_single":
-        try:
-            clean_text = re.sub(r'[^\d]', '', text)
-            idx = int(clean_text) - 1
-            my_chars = get_characters(user_id)
-            if 0 <= idx < len(my_chars):
-                chosen_char = my_chars[idx]
-                context.user_data["event_participants"] = [chosen_char]
-                
-                dear = get_dear(chosen_char)
-                msg = (
-                    f"// Прекрасно, {dear}! Какую сферу жизни затронем?\n\n"
-                    "1. 💌 Отношения и репутация\n"
-                    "2. 🏛️ Власть, карьера и положение\n"
-                    "3. 💰 Деньги, векселя и имущество\n"
-                    "4. 🕵️ Тайны и прошлое\n"
-                    "5. 🎭 Светская жизнь, быт и досуг\n"
-                    "6. 🎲 Случайный перст судьбы (выберу сама)"
-                )
-                context.user_data["event_step"] = "theme"
-                await update.message.reply_text(msg)
-            else:
-                await update.message.reply_text("// Такого номера нет в списке. Напишите верный номер или «отмена».")
-        except ValueError:
-            await update.message.reply_text("// Пожалуйста, напишите номер персонажа цифрой.")
-        return
-
-    if event_step == "select_multi_mode":
-        choice = text.strip()
-        my_chars = get_characters(user_id)
-        my_active = ACTIVE_CHARACTER.get(user_id) or my_chars[0]
-        
-        all_active_in_chat = get_all_active_characters(filter_chat_id=chat_id)
-        companions = [item for item in all_active_in_chat if item[0] != user_id]
-        
-        if not companions:
-            await update.message.reply_text(
-                "// Увы, в этом чате пока нет других представленных ко двору персонажей. "
-                "Кручу колесо одиночной судьбы для вашего персонажа! Переходим к выбору темы."
-            )
-            context.user_data["event_participants"] = [my_active]
-            msg = (
-                f"// Какую сферу жизни затронем?\n\n"
-                "1. 💌 Отношения и репутация\n"
-                "2. 🏛️ Власть, карьера и положение\n"
-                "3. 💰 Деньги, векселя и имущество\n"
-                "4. 🕵️ Тайны и прошлое\n"
-                "5. 🎭 Светская жизнь, быт и досуг\n"
-                "6. 🎲 Случайный перст судьбы (выберу сама)"
-            )
-            context.user_data["event_step"] = "theme"
-            await update.message.reply_text(msg)
-            return
-
-        if choice == "1":
-            msg = f"// Выберите компаньонов из списка (укажите один или несколько номеров через запятую или пробел):\n\n"
-            for i, (uid, c) in enumerate(companions, 1):
-                msg += f"{i}. {c.get('name', 'Без имени')} ({c.get('title', '—')})\n"
-            msg += "\n*(Напишите номера спутников или «отмена»)*"
-            
-            context.user_data["chat_active_chars"] = companions
-            context.user_data["event_step"] = "select_multi_manual"
-            await update.message.reply_text(msg)
-            
-        elif choice == "2":
-            num_to_choose = min(len(companions), random.randint(1, 3))
-            chosen_companions = random.sample(companions, num_to_choose)
-            
-            participants = [my_active] + [item[1] for item in chosen_companions]
-            context.user_data["event_participants"] = participants
-            
-            names_list = ", ".join(c.get('name') for c in participants[1:])
-            await update.message.reply_text(f"// Судьба определила вам в спутники: <b>{names_list}</b>! Переходим к выбору темы.", parse_mode="HTML")
-            
-            msg = (
-                f"// Какую сферу жизни затронем?\n\n"
-                "1. 💌 Отношения и репутация\n"
-                "2. 🏛️ Власть, карьера и положение\n"
-                "3. 💰 Деньги, векселя и имущество\n"
-                "4. 🕵️ Тайны и прошлое\n"
-                "5. 🎭 Светская жизнь, быт и досуг\n"
-                "6. 🎲 Случайный перст судьбы (выберу сама)"
-            )
-            context.user_data["event_step"] = "theme"
-            await update.message.reply_text(msg)
-        else:
-            await update.message.reply_text("// Пожалуйста, напишите цифру 1 или 2, либо «отмена».")
-        return
-
-    if event_step == "select_multi_manual":
-        companions = context.user_data.get("chat_active_chars", [])
-        my_chars = get_characters(user_id)
-        my_active = ACTIVE_CHARACTER.get(user_id) or my_chars[0]
-        
-        try:
-            nums = [int(n) for n in re.findall(r'\d+', text)]
-            selected = []
-            for num in nums:
-                idx = num - 1
-                if 0 <= idx < len(companions):
-                    selected.append(companions[idx][1])
-            
-            if not selected:
-                await update.message.reply_text("// Я не распознала номера из списка. Пожалуйста, напишите их цифрами через запятую.")
-                return
-                
-            context.user_data["event_participants"] = [my_active] + selected
-            
-            names_list = ", ".join(c.get('name') for c in selected)
-            await update.message.reply_text(f"// Отлично! С вами отправятся: <b>{names_list}</b>. Переходим к выбору темы.", parse_mode="HTML")
-            
-            msg = (
-                f"// Какую сферу жизни затронем?\n\n"
-                "1. 💌 Отношения и репутация\n"
-                "2. 🏛️ Власть, карьера и положение\n"
-                "3. 💰 Деньги, векселя и имущество\n"
-                "4. 🕵️ Тайны и прошлое\n"
-                "5. 🎭 Светская жизнь, быт и досуг\n"
-                "6. 🎲 Случайный перст судьбы (выберу сама)"
-            )
-            context.user_data["event_step"] = "theme"
-            await update.message.reply_text(msg)
-        except Exception:
-            await update.message.reply_text("// Произошла ошибка распознавания номеров. Пожалуйста, укажите верные цифры.")
-        return
-
-    if event_step == "theme":
-        choice = text.strip()
-        if choice in ["1", "2", "3", "4", "5", "6"]:
-            if choice == "1":
-                theme_str = "Отношения и репутация"
-                sub_key = "отношения"
-            elif choice == "2":
-                theme_str = "Власть, карьера и положение"
-                sub_key = "карьера"
-            elif choice == "3":
-                theme_str = "Деньги, векселя и имущество"
-                sub_key = "деньги"
-            elif choice == "4":
-                theme_str = "Тайны и прошлое"
-                sub_key = "тайны"
-            elif choice == "5":
-                sub_themes_pool = [
-                    "Театральная жизнь и премьеры",
-                    "Искусство, выставки и поэзия",
-                    "Музыкальные вечера и романсы",
-                    "Карточные игры и пари",
-                    "Светский этикет и визиты",
-                    "Питомец в большом городе",
-                    "Гастрономия и кулинарные курьезы",
-                    "Шумные рынки и барахолки",
-                    "Кофейни и кондитерские",
-                    "Уличные музыканты и шарманщики",
-                    "Петербургская мистика и тайны",
-                    "Антиквариат и старинные лавки",
-                    "Почтовые казусы и письма",
-                    "Модные ателье и портные",
-                    "Домашние снадобья и лекари",
-                    "Дорожные приключения"
-                ]
-                theme_str = random.choice(sub_themes_pool)
-                sub_key = "быт"
-            else:
-                theme_str = "Случайная тема"
-                sub_key = random.choice(["отношения", "карьера", "деньги", "тайны", "быт"])
-
-            participants = context.user_data.get("event_participants", [])
-            if not participants:
-                my_chars = get_characters(user_id)
-                participants = [ACTIVE_CHARACTER.get(user_id) or my_chars[0]]
-
-            char = participants[0]
-            mily = get_mily(char)
-            
-            char_info = json.dumps(participants, ensure_ascii=False)
-            
-            context.user_data.pop("event_step", None)
-            context.user_data.pop("event_mode", None)
-            context.user_data.pop("event_participants", None)
-            context.user_data.pop("chat_active_chars", None)
-            
-            await update.message.reply_text(f"// Кручу колесо судьбы, {mily}... Ждем вестей от курьеров! 📜")
-            
-            event_result, is_success, is_duel_conflict = await generate_roleplay_event(char_info, theme_str)
-            
-            unlocked = []
-            if is_success:
-                unlocked += check_character_achievements(user_id, char, "luck_success", 1)
-            if is_duel_conflict:
-                unlocked += check_character_achievements(user_id, char, "duels_conflicts", 1)
-            
-            cur_hour_ev = datetime.datetime.now().hour
-            if 1 <= cur_hour_ev < 5:
-                unlocked += check_character_achievements(user_id, char, "night_events", 1)
-
-            unlocked += check_character_achievements(user_id, char, "event_theme_dummy", 1, sub_category=sub_key)
-            all_ach = list(set(unlocked))
-
-            await update.message.reply_text(event_result, parse_mode="HTML")
-            if all_ach:
-                await update.message.reply_text(f"// ✨ Судьба благоволит вам! Персонаж получает тайные достижения: <b>{', '.join(all_ach)}</b>!", parse_mode="HTML")
-        else:
-            await update.message.reply_text("// Напиши цифру от 1 до 6 или «отмена».")
-        return
-
-    # ==========================
-    # Статусы персонажей (Включая слухи от других игроков)
-    # ==========================
-    pending = context.user_data.get("pending_status")
-    if pending:
-        act = pending["action"]
-        st_cat = pending["type"]
-        st_val = pending["text"]
-        target_uid = pending.get("target_uid", user_id)
-        
-        affirmatives = ["да", "согласна", "согласен", "добавь", "давай", "запиши", "конечно", "ага", "ок", "хорошо", "заноси", "пусти", "будь добра"]
-        negatives = ["нет", "отмена", "не надо", "не хочу", "не добавляй", "отмени"]
-
-        if act == "add" and any(w in lower for w in affirmatives):
-            t_chars = get_characters(target_uid)
-            success = False
-            char = None
-            if t_chars:
-                from characters import load_characters
-                db = load_characters()
-                active_idx = db.get(target_uid + "_active", 0)
-                if active_idx >= len(t_chars):
-                    active_idx = 0
-                char = t_chars[active_idx]
-                
-                clean_expired_statuses_and_rumors(char)
-                
-                for key_cat in ["permanent", "temporary", "achievements", "tragedies", "rumors"]:
-                    if key_cat not in char["changes"]:
-                        char["changes"][key_cat] = []
-
-                st_cat = normalize_status_category(st_cat)
-                    
-                if st_val not in char["changes"][st_cat]:
-                    char["changes"][st_cat].append(st_val)
-                    
-                    if st_cat in ["temporary", "rumors"]:
-                        if "status_times" not in char: char["status_times"] = {}
-                        char["status_times"][st_val] = time.time()
-                    elif st_cat == "achievements":
-                        if "achievement_times" not in char: char["achievement_times"] = {}
-                        char["achievement_times"][st_val] = time.time()
-                        
-                    clean_expired_statuses_and_rumors(char)
-                    t_chars[active_idx] = char
-                    save_characters(target_uid, t_chars)
-                    ACTIVE_CHARACTER[target_uid] = char
-                    success = True
-
-            if success and char:
-                target_display = f"персонажа «{char.get('name')}»" if target_uid != user_id else "анкету"
-                unlocked = check_character_achievements(target_uid, char, "status_added", 1)
-                
-                t_chars[active_idx] = char
-                save_characters(target_uid, t_chars)
-                ACTIVE_CHARACTER[target_uid] = char
-
-                await update.message.reply_text(f"// Готово, милая! Статус «{st_val}» добавлен в {target_display}.")
-                if unlocked and target_uid == user_id:
-                    await update.message.reply_text(f"// ✨ За бурную светскую хронику персонаж получает тайное достижение: <b>{', '.join(unlocked)}</b>!", parse_mode="HTML")
-            else:
-                await update.message.reply_text("// Не получилось записать статус (возможно, такой статус уже существует у персонажа).")
-            context.user_data.pop("pending_status", None)
-            return
-            
-        elif act == "remove" and any(w in lower for w in affirmatives):
-            t_chars = get_characters(target_uid)
-            success = False
-            char = None
-            if t_chars:
-                from characters import load_characters
-                db = load_characters()
-                active_idx = db.get(target_uid + "_active", 0)
-                if active_idx >= len(t_chars):
-                    active_idx = 0
-                char = t_chars[active_idx]
-                
-                st_cat = normalize_status_category(st_cat)
-                
-                if char and "changes" in char and st_cat in char["changes"]:
-                    if st_val in char["changes"][st_cat]:
-                        char["changes"][st_cat].remove(st_val)
-                        t_chars[active_idx] = char
-                        save_characters(target_uid, t_chars)
-                        ACTIVE_CHARACTER[target_uid] = char
-                        success = True
-            if success and char:
-                target_display = f"персонажа «{char.get('name')}»" if target_uid != user_id else "анкету"
-                await update.message.reply_text(f"// Статус «{st_val}» убран из {target_display}, дорогая.")
-            else:
-                await update.message.reply_text("// У персонажа не найден такой статус для удаления.")
-            context.user_data.pop("pending_status", None)
-            return  
-            
-        elif any(w in lower for w in negatives):
-            await update.message.reply_text("// Как скажешь, изменения отменены.")
-            context.user_data.pop("pending_status", None)
-            return
-            
-        else:
-            context.user_data.pop("pending_status", None)
-            if not is_addressed_to_katya and not is_reply and not (update.effective_chat.type == "private"):
-                return
-
-    waiting_status_type = context.user_data.get("waiting_status_type")
-    if waiting_status_type:
-        context.user_data.pop("waiting_status_type", None)
-        char = ACTIVE_CHARACTER.get(user_id)
-        if not char:
-            await update.message.reply_text("// Сначала выберите активного персонажа.")
-            return
-        st_text = text.strip(" '\"«»")
-        
-        success = False
-        if st_text:
-            clean_expired_statuses_and_rumors(char)
-            st_cat = normalize_status_category(waiting_status_type)
-                
-            if st_text not in char["changes"].get(st_cat, []):
-                if st_cat not in char["changes"]:
-                    char["changes"][st_cat] = []
-                char["changes"][st_cat].append(st_text)
-                
-                if st_cat in ["temporary", "rumors"]:
-                    if "status_times" not in char: char["status_times"] = {}
-                    char["status_times"][st_text] = time.time()
-                elif st_cat == "achievements":
-                    if "achievement_times" not in char: char["achievement_times"] = {}
-                    char["achievement_times"][st_text] = time.time()
-                    
-                clean_expired_statuses_and_rumors(char)
-                all_chars = get_characters(user_id)
-                from characters import load_characters
-                db = load_characters()
-                active_idx = db.get(user_id + "_active", 0)
-                if active_idx < len(all_chars):
-                    all_chars[active_idx] = char
-                else:
-                    for i, c in enumerate(all_chars):
-                        if c.get("name") == char.get("name"):
-                            all_chars[i] = char
-                            break
-                save_characters(user_id, all_chars)
-                ACTIVE_CHARACTER[user_id] = char
-                success = True
-
-        if success:
-            curr_char = ACTIVE_CHARACTER[user_id]
-            unlocked = check_character_achievements(user_id, curr_char, "status_added", 1)
-            await update.message.reply_text(f"// Статус успешно добавлен в анкету: {st_text}")
-            if unlocked:
-                await update.message.reply_text(f"// ✨ За бурные светские перемены персонаж получает тайное достижение: <b>{', '.join(unlocked)}</b>!", parse_mode="HTML")
-        else:
-            await update.message.reply_text("// Не удалось добавить статус. Вероятно, он уже существует.")
-        return
-
-    if context.user_data.get("waiting_status_remove"):
-        context.user_data.pop("waiting_status_remove", None)
-        st_text = text.strip(" '\"«»")
-        char = ACTIVE_CHARACTER.get(user_id)
-        if not char:
-            await update.message.reply_text("// Активный персонаж не выбран.")
-            return
-            
-        found = False
-        for cat in ["temporary", "permanent", "achievements", "tragedies", "rumors"]:
-            if cat in char.get("changes", {}) and st_text in char["changes"][cat]:
-                char["changes"][cat].remove(st_text)
-                clean_expired_statuses_and_rumors(char)
-                all_chars = get_characters(user_id)
-                from characters import load_characters
-                db = load_characters()
-                active_idx = db.get(user_id + "_active", 0)
-                if active_idx < len(all_chars):
-                    all_chars[active_idx] = char
-                else:
-                    for i, c in enumerate(all_chars):
-                        if c.get("name") == char.get("name"):
-                            all_chars[i] = char
-                            break
-                save_characters(user_id, all_chars)
-                ACTIVE_CHARACTER[user_id] = char
-                found = True
-                await update.message.reply_text(f"// Статус «{st_text}» успешно убран из анкеты, милая.")
-                break
-                
-        if not found:
-            await update.message.reply_text(f"// Я не нашла статус «{st_text}» в анкете. Проверь точное название.")
-        return
-
-    if lower in ["катя мои персонажи", "катя, мои персонажи", "катя персонажи"]:
-        chars = get_characters(user_id)
-        if not chars:
-            await update.message.reply_text("// У вас пока нет сохранённых персонажей.")
-            return
-        answer = "// Ваши персонажи:\n\n" + "\n".join(f"{i}. {c.get('name', 'Без имени')}" for i, c in enumerate(chars, 1))
-        await update.message.reply_text(answer)
-        return
-
-    match = re.search(r"катя,?\s+выбери персонажа\s+(\d+)", lower)
-    if match:
-        idx = int(match.group(1)) - 1
-        if set_active_character_local(user_id, idx):
-            curr_char = ACTIVE_CHARACTER[user_id]
-            unlocked = check_character_achievements(user_id, curr_char, "character_switches", 1)
-            await update.message.reply_text(
-                "// Хорошо. Теперь играем за:\n\n" + format_character_sheet(curr_char),
-                parse_mode="HTML"
-            )
-            if unlocked:
-                await update.message.reply_text(f"// ✨ За смену масок персонаж получает достижение: <b>{', '.join(unlocked)}</b>!", parse_mode="HTML")
-        else:
-            await update.message.reply_text("// Такого персонажа нет.")
-        return
-
-    match_del = re.search(r"катя,?\s+удали персонажа\s+(\d+)", lower)
-    if match_del:
-        idx = int(match_del.group(1)) - 1
-        chars = get_characters(user_id)
-        if 0 <= idx < len(chars):
-            rem = chars[idx]
-            remove_character(user_id, idx)
-            if ACTIVE_CHARACTER.get(user_id, {}).get("name") == rem.get("name"):
-                ACTIVE_CHARACTER.pop(user_id, None)
-            await update.message.reply_text(f"// Персонаж «{rem.get('name', 'Без имени')}» удален.")
-        else:
-            await update.message.reply_text("// Неверный номер персонажа.")
+        await context.bot.send_message(chat_id=chat_id, text="// Кто пишет эти групповые послания?", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     if lower in ["катя новая анкета", "катя, новая анкета"]:
@@ -3885,8 +3820,8 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if active_char:
         clean_expired_statuses_and_rumors(active_char)
         all_chars = get_characters(user_id)
-        from characters import load_characters
-        db = load_characters()
+        from characters import load_characters as lc_db
+        db = lc_db()
         active_idx = db.get(user_id + "_active", 0)
         if 0 <= active_idx < len(all_chars):
             all_chars[active_idx] = active_char
@@ -3897,7 +3832,9 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
         save_characters(user_id, all_chars)
 
-    # Анализ изменений и сплетен
+    # ==========================
+    # ИСПРАВЛЕННЫЙ АНАЛИЗ ДИАЛОГОВ И ЗАПИСЬ СЛУХОВ
+    # ==========================
     status_analysis = await analyze_dialogue_for_status_changes(text, answer, user_id)
     if status_analysis and status_analysis.get("action") in ["add", "remove"]:
         action = status_analysis.get("action")
@@ -3916,32 +3853,36 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if t_name_clean == c_name or t_name_clean in c_name or c_name in t_name_clean:
                     target_uid = tuid
                     target_display_name = f"анкету персонажа «{tc.get('name')}»"
+                    target_char_name = tc.get("name")
                     break
 
         if st_text:
             if action == "add":
                 proposal = f"// Кажется, в сюжете произошло событие. Добавить статус «{st_text}» в {target_display_name}?"
-                hint = "*(Ответь «Да, добавь» или «Нет, отмена»)*"
             else:
                 proposal = f"// Кажется, статус «{st_text}» больше не актуален. Удалить его из {target_display_name}?"
-                hint = "*(Ответь «Да, удали» или «Нет, отмена»)*"
 
             context.user_data["pending_status"] = {
                 "action": action,
                 "type": st_type,
                 "text": st_text,
-                "target_uid": target_uid
+                "target_uid": target_uid,
+                "target_char_name": target_char_name
             }
-            await update.message.reply_text(f"{proposal}\n\n{hint}")
+
+            confirm_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Записать", callback_data=f"status_confirm:apply:{sender_user_id}"),
+                 InlineKeyboardButton("❌ Отклонить", callback_data=f"status_confirm:cancel:{sender_user_id}")]
+            ])
+            await update.message.reply_text(proposal, reply_markup=confirm_markup)
 
     print("Запрос:", text)
 
 # ==========================
-# Запускаем бота
+# Запуск бота
 # ==========================
 
 def main():
-    # Запускаем фоновый веб-сервер для хостинга Render
     threading.Thread(target=run_health_server, daemon=True).start()
 
     print("Екатерина запускается...")
@@ -3950,23 +3891,23 @@ def main():
         Application.builder()
         .token(TELEGRAM_TOKEN)
         .connect_timeout(30.0)
-        .read_timeout(60.0)      # Увеличено до 60 секунд для надежного Long Polling
+        .read_timeout(60.0)
         .write_timeout(30.0)
         .pool_timeout(30.0)
         .post_init(post_init)
         .build()
     )
 
-    # Регистрация глобального обработчика ошибок
     app.add_error_handler(global_error_handler)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, photos))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
+    app.add_handler(CallbackQueryHandler(callbacks_handler))
     app.add_handler(MessageHandler(filters.TEXT, messages))
 
     print("Екатерина запущена!")
-    app.run_polling(drop_pending_updates=True, timeout=30)
+    app.run_polling(drop_pending_updates=True, timeout=30, bootstrap_retries=-1)
 
 if __name__ == "__main__":
     main()
