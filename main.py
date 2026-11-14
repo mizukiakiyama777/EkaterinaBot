@@ -1,4 +1,3 @@
-
 import itertools
 import re
 import io
@@ -11,6 +10,7 @@ import shutil
 import asyncio
 import threading
 import logging
+import html
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from PIL import Image
 
@@ -211,10 +211,14 @@ def clean_expired_statuses_and_rumors(char):
 # Определение точной даты и сезона
 # ==========================
 
+def get_msk_now():
+    """Возвращает текущее Московское время (UTC+3)."""
+    msk_tz = datetime.timezone(datetime.timedelta(hours=3))
+    return datetime.datetime.now(msk_tz)
+
 def get_current_season_info():
     """Определяет точное Московское время (UTC+3), день недели, число, месяц, 1838 год и сезон."""
-    msk_tz = datetime.timezone(datetime.timedelta(hours=3))
-    now = datetime.datetime.now(msk_tz)
+    now = get_msk_now()
     
     month = now.month
     day = now.day
@@ -470,6 +474,369 @@ def save_gazette_data(data):
     except Exception as e:
         print("Ошибка сохранения gazette.json:", e)
 
+# ==========================
+# ХРАНИЛИЩЕ И ЛОГИКА ЛИЧНЫХ ДНЕЙ РОЖДЕНИЯ
+# ==========================
+
+BIRTHDAYS_FILE_NAME = "birthdays.json"
+BIRTHDAYS_FILE = os.path.join(PERSISTENT_DIR, BIRTHDAYS_FILE_NAME)
+
+MONTHS_GENITIVE_BDAY = [
+    "", "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря"
+]
+
+MAX_DAYS_IN_MONTH = {
+    1: 31, 2: 29, 3: 31, 4: 30, 5: 31, 6: 30,
+    7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31
+}
+
+def load_birthdays_data():
+    if not os.path.exists(BIRTHDAYS_FILE):
+        return {"users": {}, "pinned": {}}
+    try:
+        with open(BIRTHDAYS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if "users" not in data:
+                data["users"] = {}
+            if "pinned" not in data:
+                data["pinned"] = {}
+            return data
+    except Exception as e:
+        print("Ошибка загрузки birthdays.json:", e)
+        return {"users": {}, "pinned": {}}
+
+def save_birthdays_data(data):
+    try:
+        with open(BIRTHDAYS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Ошибка сохранения birthdays.json:", e)
+
+def format_birthday_date(day, month):
+    return f"{day} {MONTHS_GENITIVE_BDAY[month]}"
+
+def parse_birthday_deterministic(raw_text):
+    """Быстрый разбор даты рождения (числа, слова, смешанный формат)."""
+    t = raw_text.lower().replace("ё", "е").strip(" .!?,")
+
+    # 1. Чистый числовой формат: 14.11, 14/11, 14-11, 14 11
+    m_num = re.match(r'^(\d{1,2})\s*[./\-\s]\s*(\d{1,2})$', t)
+    if m_num:
+        day, month = int(m_num.group(1)), int(m_num.group(2))
+        if 1 <= month <= 12 and 1 <= day <= MAX_DAYS_IN_MONTH[month]:
+            return day, month
+        return None, None
+
+    # Убираем окончания вроде 14-е, 1-го
+    t_clean = re.sub(r'(\d{1,2})\s*[-–]?\s*(?:е|ое|ье|го|ого|я)\b', r'\1', t)
+
+    month_patterns = [
+        (1, r'\bянвар[ьяею]?|\bянв\b'),
+        (2, r'\bфеврал[ьяею]?|\bфев\b'),
+        (3, r'\bмарт[аеу]?|\bмар\b'),
+        (4, r'\bапрел[ьяею]?|\bапр\b'),
+        (5, r'\bма[йяею]\b'),
+        (6, r'\bиюн[ьяею]?\b'),
+        (7, r'\bиюл[ьяею]?\b'),
+        (8, r'\bавгуст[аеу]?|\bавг\b'),
+        (9, r'\bсентябр[ьяею]?|\bсент\b|\bсен\b'),
+        (10, r'\bоктябр[ьяею]?|\bокт\b'),
+        (11, r'\bноябр[ьяею]?|\bнояб\b|\bноя\b'),
+        (12, r'\bдекабр[ьяею]?|\bдек\b'),
+    ]
+
+    found_month = None
+    remaining = t_clean
+    for m_num_val, pat in month_patterns:
+        match = re.search(pat, remaining)
+        if match:
+            found_month = m_num_val
+            remaining = (remaining[:match.start()] + " " + remaining[match.end():]).strip()
+            break
+
+    if not found_month:
+        return None, None
+
+    # 2. Если день указан цифрой
+    digit_match = re.search(r'\b(\d{1,2})\b', remaining)
+    if digit_match:
+        day = int(digit_match.group(1))
+        if 1 <= day <= MAX_DAYS_IN_MONTH[found_month]:
+            return day, found_month
+        return None, None
+
+    # 3. Если день написан словами
+    tokens = re.findall(r'[а-я]+', remaining)
+    teens = [
+        ("одиннадцат", 11), ("двенадцат", 12), ("тринадцат", 13),
+        ("четырнадцат", 14), ("пятнадцат", 15), ("шестнадцат", 16),
+        ("семнадцат", 17), ("восемнадцат", 18), ("девятнадцат", 19),
+    ]
+    tens = [("двадцат", 20), ("тридцат", 30), ("десят", 10)]
+    units = [
+        ("перв", 1), ("один", 1), ("одн", 1),
+        ("втор", 2), ("два", 2), ("две", 2),
+        ("трет", 3), ("три", 3),
+        ("четверт", 4), ("четыр", 4),
+        ("пят", 5),
+        ("шест", 6),
+        ("седьм", 7), ("сем", 7),
+        ("восьм", 8), ("восем", 8),
+        ("девят", 9),
+    ]
+
+    total_day = 0
+    matched_any = False
+    for tok in tokens:
+        matched_tok = False
+        for prefix, val in teens:
+            if tok.startswith(prefix):
+                total_day += val
+                matched_tok = True
+                break
+        if matched_tok:
+            matched_any = True
+            continue
+
+        for prefix, val in tens:
+            if tok.startswith(prefix):
+                total_day += val
+                matched_tok = True
+                break
+        if matched_tok:
+            matched_any = True
+            continue
+
+        for prefix, val in units:
+            if tok.startswith(prefix):
+                total_day += val
+                matched_tok = True
+                break
+        if matched_tok:
+            matched_any = True
+
+    if matched_any and 1 <= total_day <= MAX_DAYS_IN_MONTH[found_month]:
+        return total_day, found_month
+
+    return None, None
+
+async def parse_birthday_with_fallback(raw_text):
+    """Сначала парсит локально, при нестандартном вводе/опечатке уточняет у Gemini."""
+    day, month = parse_birthday_deterministic(raw_text)
+    if day and month:
+        return day, month
+
+    prompt = f"""
+Извлеки из текста пользователя дату рождения (ТОЛЬКО число и месяц).
+Текст пользователя: "{raw_text}"
+Ответь СТРОГО чистым JSON без пояснений и разметки:
+{{"day": 14, "month": 11}}
+Если дату понять невозможно или она не существует (например 31 февраля), верни:
+{{"day": null, "month": null}}
+"""
+    try:
+        response = await call_gemini_async(prompt)
+        raw = get_gemini_text(response)
+        clean_raw = re.sub(r'```json\s*', '', raw)
+        clean_raw = re.sub(r'```\s*', '', clean_raw).strip()
+        match = re.search(r'\{[\s\S]*\}', clean_raw)
+        if match:
+            data = json.loads(match.group(0))
+            d = data.get("day")
+            m = data.get("month")
+            if isinstance(d, int) and isinstance(m, int):
+                if 1 <= m <= 12 and 1 <= d <= MAX_DAYS_IN_MONTH[m]:
+                    return d, m
+    except Exception as e:
+        print("Ошибка ИИ-парсинга дня рождения:", e)
+    return None, None
+
+def build_birthday_message(people, day, month):
+    """Формирует торжественное поздравление по шаблону (1 человек или 2+ в одном сообщении)."""
+    date_label = format_birthday_date(day, month)
+    header = "🥂 <b>ИМПЕРАТОРСКИЙ ТОСТ | ДЕНЬ РОЖДЕНИЯ ПРИ ДВОРЕ</b>\n"
+
+    if len(people) == 1:
+        p = people[0]
+        gender = str(p.get("gender", "")).lower()
+        is_male = any(w in gender for w in ["муж", "м", "мужской", "парень", "мальчик"])
+        role_word = "Именинник дня" if is_male else "Именинница дня"
+        dear_word = "дорогой" if is_male else "дорогая"
+
+        body = (
+            f"ㅤㅤ∴ ════ ∴ ✦ ∴ ════ ∴\n\n"
+            f"📅 <b>Дата:</b> <i>{date_label}</i>\n"
+            f"🎂 <b>{role_word}:</b> <b>{html.escape(p['char_name'])}</b> ({p['mention']})\n"
+            f"│────────✤────────│\n\n"
+            f"<i>// *Екатерина II поднимает хрустальный бокал шампанского и благосклонно улыбается*</i>\n\n"
+            f"Сегодня наш петербургский свет празднует ваш особенный день, {dear_word}! "
+            f"От лица всего двора поздравляю вас с днём рождения. Пусть фортуна благоволит вам и на блестящих балах, "
+            f"и в тайных интригах, в шкатулке не переводятся ассигнации, а каждый день приносит повод для гордости и радости. "
+            f"Поднимаю бокал за ваше здравие и блистательные свершения!\n\n"
+            f"ㅤㅤ∴ ════ ∴ ✦ ∴ ════ ∴\n"
+            f"<i>С высочайшим благоволением, Императрица Екатерина II 👑</i>"
+        )
+    else:
+        list_lines = "\n".join(
+            f"• <b>{html.escape(p['char_name'])}</b> ({p['mention']})" for p in people
+        )
+        body = (
+            f"ㅤㅤ∴ ════ ∴ ✦ ∴ ════ ∴\n\n"
+            f"📅 <b>Дата:</b> <i>{date_label}</i>\n"
+            f"🎂 <b>Наши дорогие именинники дня:</b>\n"
+            f"{list_lines}\n"
+            f"│────────✤────────│\n\n"
+            f"<i>// *Екатерина II поднимает хрустальный бокал шампанского и оглядывает залу*</i>\n\n"
+            f"Сегодня наш петербургский свет празднует особенный день! От лица всего двора поздравляю вас с днём рождения, милые мои. "
+            f"Пусть фортуна не отворачивается от вас ни на балах, ни в тайных интригах, в кошельке не переводятся ассигнации, "
+            f"а перо и шпага всегда служат вам верой и правдой. Поднимаю бокал за ваше здравие и блестящие свершения при дворе!\n\n"
+            f"ㅤㅤ∴ ════ ∴ ✦ ∴ ════ ∴\n"
+            f"<i>С высочайшим благоволением, Императрица Екатерина II 👑</i>"
+        )
+
+    return f"{header}<blockquote expandable>{body}</blockquote>"
+
+async def maybe_ask_birthday_after_first_char(message, user_id, sender_user_id, chat_id):
+    """Предлагает указать личную дату рождения строго после создания самой первой анкеты."""
+    chars = get_characters(user_id)
+    if len(chars) != 1:
+        return
+    b_data = load_birthdays_data()
+    if str(sender_user_id) in b_data.get("users", {}):
+        return
+
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎂 Добавить дату рождения", callback_data=f"bday:ask:{sender_user_id}")],
+        [InlineKeyboardButton("❌ Нет, не нужно", callback_data=f"bday:decline:{sender_user_id}")]
+    ])
+    await message.get_bot().send_message(
+        chat_id=chat_id,
+        text=(
+            "// ✨ Поздравляю с вашей первой анкетой при дворе!\n"
+            "Не желаете ли указать вашу <b>личную дату рождения</b> (только число и месяц, к анкете она не привязывается), "
+            "чтобы я могла торжественно поздравить вас в этот день?"
+        ),
+        reply_markup=buttons,
+        parse_mode="HTML"
+    )
+
+async def scheduled_birthday_loop(app):
+    """Фоновый планировщик дней рождения: в 00:00 МСК открепляет старое и поздравляет/закрепляет новое."""
+    while True:
+        try:
+            now_msk = get_msk_now()
+            today_str = now_msk.strftime("%Y-%m-%d")
+            b_data = load_birthdays_data()
+            changed = False
+
+            # 1. Открепляем вчерашние поздравления, как только наступил новый день
+            for p_chat_id, p_info in list(b_data.get("pinned", {}).items()):
+                if p_info.get("pin_date") != today_str:
+                    try:
+                        await app.bot.unpin_chat_message(
+                            chat_id=int(p_chat_id),
+                            message_id=p_info["message_id"]
+                        )
+                    except Exception as e:
+                        print("Не удалось открепить вчерашнее поздравление:", e)
+                    b_data["pinned"].pop(p_chat_id, None)
+                    changed = True
+
+            # 2. В 00:00 МСК (окно 00:00–00:04) поздравляем именинников дня
+            if now_msk.hour == 0 and now_msk.minute < 5:
+                year = now_msk.year
+                is_leap = (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0))
+                grouped_by_chat = {}
+                gazette_chat = load_gazette_data().get("gazette_chat_id")
+                all_chars_db = load_characters()
+
+                for tg_uid_str, u in b_data.get("users", {}).items():
+                    if u.get("declined") or not u.get("day") or not u.get("month"):
+                        continue
+                    if u.get("last_congratulated_year") == year:
+                        continue
+
+                    u_day, u_month = u["day"], u["month"]
+                    is_today = (u_day == now_msk.day and u_month == now_msk.month)
+                    is_feb29_fallback = (
+                        not is_leap and u_day == 29 and u_month == 2
+                        and now_msk.month == 2 and now_msk.day == 28
+                    )
+                    if not (is_today or is_feb29_fallback):
+                        continue
+
+                    raw_chat_id = u.get("chat_id")
+                    if raw_chat_id and int(raw_chat_id) < 0:
+                        target_chat_id = int(raw_chat_id)
+                    elif gazette_chat:
+                        target_chat_id = int(gazette_chat)
+                    else:
+                        continue
+
+                    # Берём имя и пол первой анкеты игрока
+                    chars = get_characters(u.get("user_key", ""))
+                    if not chars:
+                        chars = get_characters(f"{target_chat_id}:{tg_uid_str}")
+                    if not chars:
+                        for k, v in all_chars_db.items():
+                            if not k.endswith("_active") and k.endswith(f":{tg_uid_str}") and v:
+                                chars = v
+                                break
+
+                    first_char = chars[0] if chars else None
+                    char_name = first_char.get("name") if first_char else None
+                    if not char_name or char_name == "—":
+                        char_name = u.get("first_name", "Гость")
+                    gender = first_char.get("gender", "") if first_char else ""
+
+                    uname = u.get("username")
+                    if uname:
+                        mention = f"@{uname.lstrip('@')}"
+                    else:
+                        mention = f'<a href="tg://user?id={u["tg_user_id"]}">{html.escape(char_name)}</a>'
+
+                    grouped_by_chat.setdefault(target_chat_id, []).append({
+                        "tg_uid_str": tg_uid_str,
+                        "char_name": char_name,
+                        "gender": gender,
+                        "mention": mention,
+                    })
+
+                for t_chat_id, people in grouped_by_chat.items():
+                    try:
+                        msg_text = build_birthday_message(people, now_msk.day, now_msk.month)
+                        sent_msg = await app.bot.send_message(
+                            chat_id=t_chat_id,
+                            text=msg_text,
+                            parse_mode="HTML"
+                        )
+                        try:
+                            await app.bot.pin_chat_message(
+                                chat_id=t_chat_id,
+                                message_id=sent_msg.message_id,
+                                disable_notification=False
+                            )
+                            b_data["pinned"][str(t_chat_id)] = {
+                                "message_id": sent_msg.message_id,
+                                "pin_date": today_str
+                            }
+                        except Exception as e:
+                            print("Не удалось закрепить поздравление с ДР:", e)
+
+                        for p in people:
+                            b_data["users"][p["tg_uid_str"]]["last_congratulated_year"] = year
+                        changed = True
+                    except Exception as e:
+                        print(f"Ошибка отправки поздравления в чат {t_chat_id}:", e)
+
+            if changed:
+                save_birthdays_data(b_data)
+        except Exception as e:
+            print("Ошибка в планировщике дней рождения:", e)
+
+        await asyncio.sleep(30)
+
 async def publish_weekly_gazette(bot, target_chat_id=None):
     """Генерирует, публикует, открепляет старую и закрепляет новую газету."""
     g_data = load_gazette_data()
@@ -488,7 +855,7 @@ async def publish_weekly_gazette(bot, target_chat_id=None):
         ads_text = "• <i>На текущую неделю особых объявлений от жителей столицы в редакцию не поступало.</i>"
 
     society_registry = get_global_society_registry()
-    date_str = datetime.datetime.now().strftime("%d.%m.") + "1838г."
+    date_str = get_msk_now().strftime("%d.%m.") + "1838г."
     date_season_info = get_current_season_info()
 
     prompt = f"""
@@ -599,6 +966,7 @@ async def scheduled_monday_gazette_loop(app):
 async def post_init(application: Application) -> None:
     """Безопасный запуск фоновых задач после инициализации бота."""
     asyncio.create_task(scheduled_monday_gazette_loop(application))
+    asyncio.create_task(scheduled_birthday_loop(application))
 
 # ==========================
 # Глобальный обработчик сетевых и непредвиденных ошибок
@@ -1669,6 +2037,7 @@ async def ask_katya(text, user_id, username=None):
             return "// У меня временные проблемы."
     return "// Лимит ключей исчерпан."
 
+
 # ==========================
 # Telegram Handlers
 # ==========================
@@ -1914,6 +2283,42 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("// Ошибка: персонаж не найден.")
         return
 
+    # 1.5 КНОПКИ ЛИЧНОЙ ДАТЫ РОЖДЕНИЯ
+    if action_prefix == "bday":
+        b_action = parts[1]
+        if b_action in ["ask", "menu"]:
+            context.user_data["waiting_birthday"] = True
+            cancel_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Отмена", callback_data=f"bday:cancel:{clicker_user_id}")]
+            ])
+            await query.edit_message_text(
+                "// 🎂 Напишите вашу <b>дату рождения</b> (только число и месяц) — можно цифрами, словами или смешанно.\n"
+                "<i>Например: 14.11, 14 ноября или четырнадцатого ноября</i>",
+                reply_markup=cancel_kb,
+                parse_mode="HTML"
+            )
+        elif b_action == "decline":
+            b_data = load_birthdays_data()
+            uid_key = str(clicker_user_id)
+            existing = b_data["users"].get(uid_key, {})
+            existing.update({
+                "tg_user_id": clicker_user_id,
+                "chat_id": chat_id,
+                "user_key": user_id_str,
+                "username": update.effective_user.username or existing.get("username"),
+                "first_name": update.effective_user.first_name or existing.get("first_name", "Гость"),
+                "declined": True,
+            })
+            b_data["users"][uid_key] = existing
+            save_birthdays_data(b_data)
+            await query.edit_message_text(
+                "// Как пожелаете, милая! Если передумаете, дату рождения всегда можно указать через команду /мои_персонажи."
+            )
+        elif b_action == "cancel":
+            context.user_data.pop("waiting_birthday", None)
+            await query.edit_message_text("// Хорошо, оставим это на потом.")
+        return
+
     # 2. ПОДТВЕРЖДЕНИЕ СТАТУСА/СЛУХА КНОПКАМИ (ИСПРАВЛЕНО)
     if action_prefix == "status_confirm":
         act_choice = parts[1]
@@ -2085,7 +2490,7 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         unlocked = []
         if is_success: unlocked += check_character_achievements(user_id_str, char, "luck_success", 1)
         if is_duel_conflict: unlocked += check_character_achievements(user_id_str, char, "duels_conflicts", 1)
-        if 1 <= datetime.datetime.now().hour < 5: unlocked += check_character_achievements(user_id_str, char, "night_events", 1)
+        if 1 <= get_msk_now().hour < 5: unlocked += check_character_achievements(user_id_str, char, "night_events", 1)
         unlocked += check_character_achievements(user_id_str, char, "event_theme_dummy", 1, sub_category=sub_key)
 
         await context.bot.send_message(chat_id=chat_id, text=event_result, parse_mode="HTML")
@@ -2400,7 +2805,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("// Не удалось найти ID одного из участников в кэше юзернеймов.")
             return
 
-        end_time_str = datetime.datetime.now().strftime("%H:%M")
+        end_time_str = get_msk_now().strftime("%H:%M")
         apply_duel_result(win_uid, "win", lose_uname, "Админ-арбитраж", end_time_str)
         apply_duel_result(lose_uid, "loss", win_uname, "Админ-арбитраж", end_time_str)
 
@@ -2424,6 +2829,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         or context.user_data.get("waiting_status_type")
         or context.user_data.get("waiting_status_remove")
         or context.user_data.get("ad_step")
+        or context.user_data.get("waiting_birthday")
     )
 
     # ==========================
@@ -2456,6 +2862,13 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         buttons = [[InlineKeyboardButton(f"{i}. {c.get('name', 'Без имени')} ({c.get('title', '—')})", callback_data=f"switch_char:{i-1}:{sender_user_id}")] for i, c in enumerate(chars, 1)]
+        b_data = load_birthdays_data()
+        u_bday = b_data.get("users", {}).get(str(sender_user_id))
+        if u_bday and u_bday.get("day") and u_bday.get("month"):
+            bday_btn_text = f"🎂 Дата рождения: {format_birthday_date(u_bday['day'], u_bday['month'])} (изменить)"
+        else:
+            bday_btn_text = "🎂 Указать мою дату рождения"
+        buttons.append([InlineKeyboardButton(bday_btn_text, callback_data=f"bday:menu:{sender_user_id}")])
         await update.message.reply_text("// Ваши персонажи двора. Нажмите на кнопку, чтобы играть за выбранного:", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
@@ -2872,6 +3285,49 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_addressed_to_katya and not is_reply and not has_active_state and not is_command and not is_private:
         return
 
+    # ==========================
+    # ВВОД ЛИЧНОЙ ДАТЫ РОЖДЕНИЯ
+    # ==========================
+    if context.user_data.get("waiting_birthday"):
+        if lower in ["отмена", "нет", "отменить", "стоп"]:
+            context.user_data.pop("waiting_birthday", None)
+            await update.message.reply_text("// Хорошо, ввод даты рождения отменён.")
+            return
+
+        day, month = await parse_birthday_with_fallback(text)
+        if not day or not month:
+            await update.message.reply_text(
+                "// Простите, я не смогла разобрать число и месяц. Напишите, пожалуйста, ещё раз "
+                "(например: <code>14.11</code>, <code>14 ноября</code> или <code>четырнадцатое ноября</code>) "
+                "либо напишите «отмена».",
+                parse_mode="HTML"
+            )
+            return
+
+        b_data = load_birthdays_data()
+        uid_key = str(sender_user_id)
+        old_entry = b_data["users"].get(uid_key, {})
+        b_data["users"][uid_key] = {
+            "tg_user_id": sender_user_id,
+            "chat_id": chat_id,
+            "user_key": user_id,
+            "username": username or old_entry.get("username"),
+            "first_name": first_name,
+            "day": day,
+            "month": month,
+            "declined": False,
+            "last_congratulated_year": old_entry.get("last_congratulated_year"),
+        }
+        save_birthdays_data(b_data)
+        context.user_data.pop("waiting_birthday", None)
+
+        await update.message.reply_text(
+            f"// 🎂 Записала вашу личную дату рождения: <b>{format_birthday_date(day, month)}</b>!\n"
+            f"В этот день ровно в полночь по Москве я обязательно подниму за вас бокал при дворе.",
+            parse_mode="HTML"
+        )
+        return
+
     creation_triggers = ["/start", "новая анкета", "создать анкету"]
     is_creation_request = any(trigger in lower for trigger in creation_triggers)
 
@@ -2922,7 +3378,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if sender_user_id not in ADMIN_IDS:
             insults = [
                 "// *Крутит у виска веером* Какая дерзость! Эта информация строго конфиденциальна.",
-                "// *Выразительно крутит у виска* Полноте, голунчик, вам не положено знать чужие тайны.",
+                "// *Выразительно крутит у виска* Полноте, голубчик, вам не положено знать чужие тайны.",
                 "// *Императорски крутит у виска* Оставьте свои праздные любопытства, сие есть государственная тайна!",
                 "// *С легким презрением крутит у виска* С чего вы решили, что вам откроют архивы высшего света?"
             ]
@@ -3198,7 +3654,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p2_id = USERNAME_CACHE.get(p2_uname)
         
         duration = get_status_duration(d["start_time"])
-        end_time_str = datetime.datetime.now().strftime("%H:%M")
+        end_time_str = get_msk_now().strftime("%H:%M")
         
         p2_name = "Неизвестный противник"
         if p2_id:
@@ -3687,6 +4143,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=chat_id,
                     text=f"Персонаж {char.get('name')} успешно добавлен и готов к светской жизни!"
                 )
+            await maybe_ask_birthday_after_first_char(update.message, user_id, sender_user_id, chat_id)
         return
 
     if user_id in WAITING_CHARACTER_UPDATE:
@@ -3711,6 +4168,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         
         await update.message.reply_text(f"<blockquote expandable>Персонаж {char.get('name')} добавлен.</blockquote>", parse_mode="HTML")
+        await maybe_ask_birthday_after_first_char(update.message, user_id, sender_user_id, chat_id)
         return
 
     if lower in [
@@ -3795,7 +4253,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         unlocked_msgs = check_character_achievements(user_id, active_char, "messages_to_katya", 1)
         unlocked_replies = check_character_achievements(user_id, active_char, "total_replies", 1)
 
-        cur_hour_msg = datetime.datetime.now().hour
+        cur_hour_msg = get_msk_now().hour
         if 1 <= cur_hour_msg < 5:
             unlocked_night = check_character_achievements(user_id, active_char, "night_messages", 1)
 
@@ -3911,3 +4369,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
