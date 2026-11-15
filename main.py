@@ -1672,6 +1672,46 @@ async def analyze_question_for_rule(user_text):
 # Функция для создания изысканных писем (Одиночные)
 # ==========================
 
+def _enforce_expandable_letter_html(raw_text, is_group=False):
+    """Принудительно очищает HTML от мусора Gemini и гарантирует теги <blockquote expandable>."""
+    if not raw_text:
+        return ""
+    ans = raw_text.strip()
+    ans = re.sub(r'^```(?:html)?\s*', '', ans, flags=re.IGNORECASE)
+    ans = re.sub(r'\s*```$', '', ans)
+    ans = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', ans)
+    ans = re.sub(r'</?h[1-6]\s*[^>]*>', '', ans, flags=re.IGNORECASE)
+    ans = re.sub(r'</?p\s*[^>]*>', '\n\n', ans, flags=re.IGNORECASE)
+    ans = re.sub(r'<br\s*/?>', '\n', ans, flags=re.IGNORECASE)
+    ans = re.sub(r'</?div\s*[^>]*>', '\n', ans, flags=re.IGNORECASE)
+    ans = re.sub(r'</?span\s*[^>]*>', '', ans, flags=re.IGNORECASE)
+    ans = re.sub(r'\n{3,}', '\n\n', ans).strip()
+
+    # Любой <blockquote> превращаем строго в <blockquote expandable>
+    ans = re.sub(r'<blockquote(?:\s+[^>]*)?>', '<blockquote expandable>', ans, flags=re.IGNORECASE)
+    ans = re.sub(r'</blockquote>', '</blockquote>', ans, flags=re.IGNORECASE)
+
+    # Если ИИ вообще забыл тег цитаты — оборачиваем сами
+    if '<blockquote' not in ans.lower():
+        if not is_group:
+            m_adr = re.search(r'(?is)(.*?)\n+(адресат\s*:[^\n]+)\s*$', ans)
+            if m_adr:
+                body_part = m_adr.group(1).strip()
+                adr_part = m_adr.group(2).strip()
+                ans = f"<blockquote expandable>{body_part}</blockquote>\n<blockquote expandable>{adr_part}</blockquote>"
+            else:
+                ans = f"<blockquote expandable>{ans}</blockquote>"
+        else:
+            ans = f"<blockquote expandable>{ans}</blockquote>"
+
+    # Страховка от незакрытого тега
+    open_cnt = len(re.findall(r'<blockquote\b[^>]*>', ans, flags=re.IGNORECASE))
+    close_cnt = len(re.findall(r'</blockquote>', ans, flags=re.IGNORECASE))
+    if open_cnt > close_cnt:
+        ans += "</blockquote>" * (open_cnt - close_cnt)
+
+    return ans
+
 async def rewrite_letter_command_with_char(text, active_character):
     char_context = ""
     if active_character:
@@ -1690,18 +1730,21 @@ async def rewrite_letter_command_with_char(text, active_character):
 Пользователь передал черновик письма или мысль: "{text}"
 
 СТРОГИЕ ПРАВИЛА ВЫВОДА:
-1. Выдай СРАЗУ ГОТОВОЕ ПИСЬМО в изысканном эпистолярном стиле XIX века. 
+1. Выдай СРАЗУ ГОТОВОЕ ПИСЬМО в изысканном, развёрнутом эпистолярном стиле XIX века (минимум 5–7 красивых строк с обращением, основной мыслью и подписью, чтобы письмо выглядело полноценно).
 2. ДОРЕФОРМЕННАЯ ОРФОГРАФИЯ: Обязательно пиши текст по правилам русской дореформенной орфографии (ѣ, i, ѳ, ъ на конце слов после согласных, -аго/-яго).
-3. ЗАПРЕЩЕНО писать любые вводные слова. Только текст самого письма.
+3. ЗАПРЕЩЕНО писать любые вводные слова и markdown-блоки ```html. Только сам результат.
 4. ОФОРМЛЕНИЕ ЦИТАТ И АДРЕСАТА:
-   - Первая цитата (текст письма): <blockquote expandable> Текст обращения, само письмо, подпись и в конце: ㅤㅤ∴ ════ ∴ ✦ ════ ∴ ㅤㅤ </blockquote>
-   - Вторая цитата (отдельно): <blockquote expandable> Адресат: [Титул и Имя получателя] ([username, если есть]) </blockquote>
-5. ТЕХНИЧЕСКОЕ ТАБУ: Используй ТОЛЬКО разрешенные теги Telegram. Запрещены теги <br>, <div>, <span>.
+   - Первая цитата (текст письма): <blockquote expandable>Текст обращения, само письмо, подпись и в конце:
+ㅤㅤ∴ ════ ∴ ✦ ════ ∴</blockquote>
+   - Вторая цитата (отдельно): <blockquote expandable>Адресат: [Титул и Имя получателя] ([username, если есть])</blockquote>
+5. ТЕХНИЧЕСКОЕ ТАБУ: Используй ТОЛЬКО разрешенные теги Telegram (`<blockquote>`, `<b>`, `<i>`, `<u>`, `<s>`). Запрещены теги <br>, <div>, <span>, <p>.
 """
     try:
         response = await call_gemini_async(prompt)
         ans = get_gemini_text(response)
-        return ans if ans else "// Охъ, милая, чернильница опрокинулась, и письмо не удалось составить."
+        if not ans:
+            return "// Охъ, милая, чернильница опрокинулась, и письмо не удалось составить."
+        return _enforce_expandable_letter_html(ans, is_group=False)
     except Exception as e:
         print("Ошибка генерации письма:", e)
         return "// Охъ, милая, чернильница опрокинулась, и письмо не удалось составить. Попробуйте еще раз."
@@ -1728,18 +1771,29 @@ async def generate_group_letters_command_with_char(query_text, active_character)
 Пользователь передал данные для ГРУППОВОГО письма: "{query_text}"
 
 СТРОГИЕ ПРАВИЛА ВЫВОДА:
-1. ДОРЕФОРМЕННАЯ ОРФОГРАФИЯ (ѣ, i, ѳ, ъ на конце слов).
-2. ЗАПРЕЩЕНО писать любые вводные слова.
-3. СТРУКТУРА ВЫВОДА:
-   Для каждого адресата выводи пару блоков в ОТДЕЛЬНЫХ ЦИТАТАХ:
-   - Первая цитата: <blockquote expandable> Текст письма... </blockquote>
-   - Вторая цитата: <blockquote expandable> Адресат: [Имя] (@[username]) </blockquote>
-4. ТЕХНИЧЕСКОЕ ТАБУ: Запрещены теги <br>, <div>, <span>.
+1. ДОРЕФОРМЕННАЯ ОРФОГРАФИЯ (ѣ, i, ѳ, ъ на конце слов). Пиши письмо развёрнуто (минимум 5–7 строк с обращением и подписью).
+2. ЗАПРЕЩЕНО писать любые вводные слова и markdown-блоки ```html.
+3. ОПРЕДЕЛИ РЕЖИМ (Одинаковое или Разное):
+   - РЕЖИМ А (ОДИНАКОВОЕ ПОСЛАНИЕ): Если пользователь указал, что письмо «одинаковое», ИЛИ передал один общий текст/тему без индивидуальных особенностей для разных людей:
+     * Выведи ТОЛЬКО ОДНО общее письмо в одной цитате:
+       <blockquote expandable>Текст общего письма...
+ㅤㅤ∴ ════ ∴ ✦ ════ ∴</blockquote>
+     * Внутри этого общего письма во ВСЕХ словах, указывающих на пол получателя (обращения, прилагательные, причастия, глаголы прошедшего времени), ОБЯЗАТЕЛЬНО пиши оба варианта через косую черту — например: «прекрасен/на», «дорогой/ая», «любезный/ая», «милостивый/ая государь/ыня», «уважаемый/ая», «согласен/на», «прибылъ/а».
+     * Ниже выведи ОДНУ отдельную цитату сразу со всеми адресатами:
+       <blockquote expandable>Адресаты: [Имя 1] (@[username1]), [Имя 2] (@[username2])...</blockquote>
+   - РЕЖИМ Б (РАЗНЫЕ ПОСЛАНИЯ): Если пользователь указал, что письма «разные», ИЛИ задал индивидуальные детали для каждого получателя:
+     * Для каждого адресата выводи отдельную пару цитат:
+       <blockquote expandable>Текст личного письма...
+ㅤㅤ∴ ════ ∴ ✦ ════ ∴</blockquote>
+       <blockquote expandable>Адресат: [Имя] (@[username])</blockquote>
+4. ТЕХНИЧЕСКОЕ ТАБУ: Запрещены теги <br>, <div>, <span>, <p>.
 """
     try:
         response = await call_gemini_async(prompt)
         ans = get_gemini_text(response)
-        return ans if ans else "// Охъ, милая, чернильница опрокинулась, групповые послания не удалось составить."
+        if not ans:
+            return "// Охъ, милая, чернильница опрокинулась, групповые послания не удалось составить."
+        return _enforce_expandable_letter_html(ans, is_group=True)
     except Exception as e:
         print("Ошибка генерации группового письма:", e)
         return "// Охъ, милая, чернильница опрокинулась, групповые послания не удалось составить."
