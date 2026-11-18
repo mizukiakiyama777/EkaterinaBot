@@ -27,7 +27,10 @@ GEMINI_KEYS = [
 ]
 GEMINI_KEYS = [key for key in GEMINI_KEYS if key]
 
-MODEL_NAME = os.getenv("MODEL_NAME", "gemini-3.1-flash-lite")
+# Разграничение моделей (не выше gemini-3.6-flash)
+MODEL_NAME = os.getenv("MODEL_NAME", "gemini-3.6-flash")
+MODEL_SMART = os.getenv("MODEL_SMART", "gemini-3.6-flash")
+MODEL_LITE = os.getenv("MODEL_LITE", "gemini-3.5-flash-lite")
 
 # ==========================
 # Логи при запуске
@@ -35,4 +38,5 @@ MODEL_NAME = os.getenv("MODEL_NAME", "gemini-3.1-flash-lite")
 print("OWNER_ID:", OWNER_ID)
 print("ROLE_OWNER_ID:", ROLE_OWNER_ID)
 print("Найдено Gemini ключей:", len(GEMINI_KEYS))
+print("Умная модель:", MODEL_SMART, "| Лёгкая модель:", MODEL_LITE)
 print("Подключение к Supabase:", "✅ Настроено" if SUPABASE_URL and SUPABASE_KEY else "❌ Ключи не найдены в .env")
