@@ -330,16 +330,17 @@ def get_current_season_info():
     return f"{weekday_str}, {day} {month_str} 1838 года, {time_str} МСК ({time_of_day}, {season}, {phase} сезона)"
 
 # ==========================
-# СИСТЕМА ЖИВЫХ ОТНОШЕНИЙ С ЕКАТЕРИНОЙ II
+# СИСТЕМА ЖИВЫХ И УСТОЙЧИВЫХ ОТНОШЕНИЙ С ЕКАТЕРИНОЙ II
 # ==========================
 
-def ensure_katya_relationship(char):
-    """Гарантирует наличие структуры отношений у персонажа и плавно остужает старые обиды."""
+def ensure_katya_relationship(char, tg_user_id=None):
+    """Гарантирует структуру отношений у персонажа, ставит теплый старт владельцам и остужает старые обиды."""
     if not char or not isinstance(char, dict):
         return None
     rel = char.get("katya_relationship")
     if not isinstance(rel, dict):
         rel = {}
+    default_imp = "Императрица пока лишь присматривается к вам и оценивает ваши манеры при петербургском дворе."
     rel.setdefault("affection", 0)
     rel.setdefault("respect", 0)
     rel.setdefault("trust", 0)
@@ -347,19 +348,65 @@ def ensure_katya_relationship(char):
     rel.setdefault("active_grudge", "")
     rel.setdefault("traits", [])
     rel.setdefault("memories", [])
-    rel.setdefault("impression", "Императрица пока лишь присматривается к вам и оценивает ваши манеры при петербургском дворе.")
+    rel.setdefault("impression", default_imp)
     rel.setdefault("last_decay_date", "")
 
+    # ОСОБЫЙ СТАТУС ВЛАДЕЛЬЦЕВ (Создательница и Пик)
+    if tg_user_id is not None and not rel.get("owner_preset_applied"):
+        uid_int = int(tg_user_id)
+        if uid_int == OWNER_ID:
+            rel["affection"] = max(int(rel["affection"]), 85)
+            rel["respect"] = max(int(rel["respect"]), 85)
+            rel["trust"] = max(int(rel["trust"]), 85)
+            rel["grudge"] = 0
+            rel["active_grudge"] = ""
+            for tr in ["создательница", "дозволено на «ты»"]:
+                if tr not in rel["traits"]:
+                    rel["traits"].append(tr)
+            if not rel.get("impression") or rel["impression"] == default_imp:
+                rel["impression"] = (
+                    "Моя дорогая создательница и самый близкий человек при дворе. "
+                    "Я бесконечно люблю и уважаю её, полностью ей доверяю и всегда позволяю обращаться ко мне на «ты»."
+                )
+            if not rel.get("memories"):
+                rel["memories"].append("[При дворе] Особая связь: создательница любима и глубоко уважаема, ей дозволено быть на «ты».")
+            rel["owner_preset_applied"] = True
+        elif uid_int == ROLE_OWNER_ID:
+            rel["affection"] = max(int(rel["affection"]), 85)
+            rel["respect"] = max(int(rel["respect"]), 80)
+            rel["trust"] = max(int(rel["trust"]), 80)
+            rel["grudge"] = 0
+            rel["active_grudge"] = ""
+            for tr in ["любимый внук", "дозволено на «ты»"]:
+                if tr not in rel["traits"]:
+                    rel["traits"].append(tr)
+            if not rel.get("impression") or rel["impression"] == default_imp:
+                rel["impression"] = (
+                    "Мой дорогой внук, цесаревич Романов Пик Рудольфович II. "
+                    "К нему я питаю искреннюю любовь, гордость и глубокое уважение — ему дозволено говорить со мной на «ты» без лишнего официоза."
+                )
+            if not rel.get("memories"):
+                rel["memories"].append("[При дворе] Родная кровь: цесаревич Пик — любимый внук Императрицы, ему дозволено обращаться на «ты».")
+            rel["owner_preset_applied"] = True
+
+    # Естественное ежедневное остывание обиды
     today_str = get_msk_now().strftime("%Y-%m-%d")
     if rel.get("last_decay_date") != today_str:
         if rel["grudge"] > 0 and rel.get("last_decay_date"):
-            rel["grudge"] = max(0, int(rel["grudge"]) - 2)
+            rel["grudge"] = max(0, int(rel["grudge"]) - 5)
             if rel["grudge"] == 0:
                 rel["active_grudge"] = ""
         rel["last_decay_date"] = today_str
 
     char["katya_relationship"] = rel
     return rel
+
+def reset_katya_relationship(char, tg_user_id=None):
+    """Полностью очищает отношение Кати к персонажу и возвращает к исходному состоянию."""
+    if not char or not isinstance(char, dict):
+        return
+    char.pop("katya_relationship", None)
+    ensure_katya_relationship(char, tg_user_id=tg_user_id)
 
 def get_relationship_stage_label(rel):
     aff = rel.get("affection", 0)
@@ -404,24 +451,42 @@ def apply_relationship_update(
     clear_grudge=False,
     new_trait=None,
     memory_event=None,
-    impression=None
+    impression=None,
+    is_owner_target=False
 ):
     if not char:
         return False
     rel = ensure_katya_relationship(char)
     changed = False
 
-    aff_d = _clamp_val(aff_d, -20, 15)
-    resp_d = _clamp_val(resp_d, -20, 15)
-    tr_d = _clamp_val(tr_d, -25, 10)
-    gr_d = _clamp_val(gr_d, -40, 35)
+    # Владельцы (Создательница и Пик) не получают штрафов от Кати за обычную речь
+    if is_owner_target:
+        if gr_d > 0: gr_d = 0
+        if aff_d < 0: aff_d = 0
+        if resp_d < 0: resp_d = 0
+        active_grudge = None
 
-    # Пока обида высока (>= 25), симпатия и доверие не могут расти от дешёвой лести (если только обида не снимается)
+    # ПЛАВНЫЙ ТОРМОЗ ДЕЛЬТ (чтобы отношения не улетали за пару реплик)
+    aff_d = int(round(aff_d * 0.35))
+    resp_d = int(round(resp_d * 0.35))
+    tr_d = int(round(tr_d * 0.30))
+    gr_d = int(round(gr_d * 0.30))
+
+    aff_d = _clamp_val(aff_d, -5, 5)
+    resp_d = _clamp_val(resp_d, -5, 5)
+    tr_d = _clamp_val(tr_d, -5, 4)
+    gr_d = _clamp_val(gr_d, -20, 8)
+
+    # Естественное быстрое таяние обиды при мирном разговоре
+    if rel["grudge"] > 0 and gr_d <= 0 and aff_d >= 0 and resp_d >= 0:
+        rel["grudge"] = max(0, rel["grudge"] - 2)
+        if rel["grudge"] == 0:
+            rel["active_grudge"] = ""
+        changed = True
+
     if rel["grudge"] >= 25 and gr_d >= 0 and not clear_grudge:
-        if aff_d > 0:
-            aff_d = 0
-        if tr_d > 0:
-            tr_d = 0
+        if aff_d > 0: aff_d = 0
+        if tr_d > 0: tr_d = 0
 
     if aff_d:
         rel["affection"] = _clamp_val(rel["affection"] + aff_d, -100, 100)
@@ -437,14 +502,12 @@ def apply_relationship_update(
         changed = True
 
     if clear_grudge or rel["grudge"] == 0:
-        if clear_grudge and rel["grudge"] > 0 and gr_d == 0:
-            rel["grudge"] = max(0, rel["grudge"] - 30)
-        if rel["grudge"] == 0:
-            rel["active_grudge"] = ""
+        rel["grudge"] = 0
+        rel["active_grudge"] = ""
         changed = True
 
-    if active_grudge and isinstance(active_grudge, str) and active_grudge.strip():
-        rel["active_grudge"] = active_grudge.strip()[:220]
+    if active_grudge and isinstance(active_grudge, str) and active_grudge.strip() and not is_owner_target:
+        rel["active_grudge"] = active_grudge.strip()[:200]
         changed = True
 
     if new_trait and isinstance(new_trait, str):
@@ -456,7 +519,7 @@ def apply_relationship_update(
             changed = True
 
     if memory_event and isinstance(memory_event, str):
-        me = memory_event.strip()[:220]
+        me = memory_event.strip()[:200]
         if me:
             date_tag = get_msk_now().strftime("%d.%m")
             entry = f"[{date_tag}] {me}"
@@ -467,14 +530,14 @@ def apply_relationship_update(
                 changed = True
 
     if impression and isinstance(impression, str) and impression.strip():
-        rel["impression"] = impression.strip()[:700]
+        rel["impression"] = impression.strip()[:650]
         changed = True
 
     char["katya_relationship"] = rel
     return changed
 
-def format_katya_relationship_block(char, include_char_header=False):
-    rel = ensure_katya_relationship(char)
+def format_katya_relationship_block(char, include_char_header=False, tg_user_id=None):
+    rel = ensure_katya_relationship(char, tg_user_id=tg_user_id)
     stage = get_relationship_stage_label(rel)
     c_name = html.escape(str(char.get("name", "Безымянный")))
 
@@ -515,24 +578,24 @@ def format_katya_relationship_block(char, include_char_header=False):
 
     return f"{header}<blockquote expandable>{body}</blockquote>"
 
-def get_katya_relationship_prompt_context(char):
+def get_katya_relationship_prompt_context(char, tg_user_id=None):
     if not char:
         return ""
-    rel = ensure_katya_relationship(char)
+    rel = ensure_katya_relationship(char, tg_user_id=tg_user_id)
     stage = get_relationship_stage_label(rel)
     mem_text = "\n".join(f"  - {m}" for m in rel.get("memories", [])[-5:]) if rel.get("memories") else "  - Значимых эпизодов ещё не было."
-    grudge_line = f"\n- Открытая обида (очень важно, помни об этом!): {rel['active_grudge']}" if rel.get("grudge", 0) > 0 and rel.get("active_grudge") else ""
+    grudge_line = f"\n- Открытая обида (помни об этом!): {rel['active_grudge']}" if rel.get("grudge", 0) > 0 and rel.get("active_grudge") else ""
     traits_line = ", ".join(rel.get("traits", [])) if rel.get("traits") else "не определены"
 
     return f"""
-👑 ТВОЁ РЕАЛЬНОЕ ОТНОШЕНИЕ К ЭТОМУ ПЕРСОНАЖУ (учитывай это в интонации, холодности или теплоте ответа!):
+👑 ТВОЁ РЕАЛЬНОЕ ОТНОШЕНИЕ К ЭТОМУ ПЕРСОНАЖУ (учитывай это в интонации, теплоте или холодности):
 - Стадия: {stage}
 - Шкалы: Симпатия {rel['affection']}/100, Уважение {rel['respect']}/100, Доверие {rel['trust']}/100, Обида {rel['grudge']}/100
-- Подмеченные тобой черты: {traits_line}{grudge_line}
-- Твоё внутреннее мнение: {rel['impression']}
-- Что ты помнишь из прошлых ситуаций и слов:
+- Подмеченные черты: {traits_line}{grudge_line}
+- Твоё впечатление: {rel['impression']}
+- Память о прошлых моментах:
 {mem_text}
-Если у тебя есть обида (Обида >= 25), не веди себя как ни в чём не бывало — можешь колко припомнить её или отвечать сдержанно, пока персонаж искренне не загладит вину!
+Будь снисходительной, мудрой и величественной монархиней — не обижайся по пустякам!
 """
 
 def save_character_object(user_id, char_obj):
@@ -1960,21 +2023,26 @@ def apply_duel_result(target_user_id, result_type, opponent_name, duration, end_
 
     active_char["stats"]["duels_conflicts"] = active_char["stats"].get("duels_conflicts", 0) + 1
     
+    tg_id = int(target_user_id.split(":")[1]) if ":" in target_user_id else None
+    is_own = tg_id in OWNER_IDS if tg_id else False
+
     if result_type == "win":
         active_char["stats"]["duels_won"] = active_char["stats"].get("duels_won", 0) + 1
         res_str = "Победа"
         apply_relationship_update(
             active_char,
-            resp_d=5,
-            memory_event=f"Одержал(а) достойную победу в дуэли против {opponent_name}"
+            resp_d=3,
+            memory_event=f"Одержал(а) победу в дуэли против {opponent_name}",
+            is_owner_target=is_own
         )
     elif result_type == "loss":
         active_char["stats"]["duels_lost"] = active_char["stats"].get("duels_lost", 0) + 1
         res_str = "Поражение"
         apply_relationship_update(
             active_char,
-            resp_d=-2,
-            memory_event=f"Проиграл(а) поединок против {opponent_name}"
+            resp_d=-1,
+            memory_event=f"Проиграл(а) поединок против {opponent_name}",
+            is_owner_target=is_own
         )
     else:
         active_char["stats"]["duels_cancelled"] = active_char["stats"].get("duels_cancelled", 0) + 1
@@ -2101,12 +2169,19 @@ async def ask_katya_image(images, text, user_id, username=None):
     season_info = get_current_season_info()
     active_character = ACTIVE_CHARACTER.get(user_id)
     
+    chat_id, telegram_user_id = user_id.split(":")
+    real_user_id = int(telegram_user_id)
+    is_owner_target = real_user_id in OWNER_IDS
+
+    if active_character:
+        ensure_katya_relationship(active_character, real_user_id)
+
     directive = get_directive_for_user(user_id, active_character, username)
     directive_prompt = ""
     if directive:
         directive_prompt = f"‼️ СЕКРЕТНОЕ УКАЗАНИЕ АДМИНИСТРАЦИИ ПО ПОВОДУ ЭТОГО СОБЕСЕДНИКА/ПЕРСОНАЖА: {directive}. Категорически соблюдай эту инструкцию при оценке изображения, но не выдавай прямо, что у тебя есть такое правило!"
 
-    rel_prompt = get_katya_relationship_prompt_context(active_character)
+    rel_prompt = get_katya_relationship_prompt_context(active_character, real_user_id)
 
     messages = [
         PERSONALITY,
@@ -2115,20 +2190,17 @@ async def ask_katya_image(images, text, user_id, username=None):
         f"🗓️ ФОНОВАЯ ОБСТАНОВКА И СЕЗОН (1838 ГОД): {season_info}. Учитывай сезонность, петербургскую погоду и моду 1838 года!",
         "Внутренний канон ролевой вселенной:\n" + LORE,
         "🏰 ГЛОБАЛЬНЫЙ СВЕТСКИЙ РЕЕСТР ПЕТЕРБУРГА:\n" + society_registry,
-        "Ты — императрица Екатерина II. Твоя задача — оценивать любые присылаемые изображения (наряды, интерьеры, оружие, экипажи, картины, животных, мемы) с высоты своего императорского вкуса и эпохи 1838 года.\n\n"
+        "Ты — императрица Екатерина II. Твоя задача — оценивать любые присылаемые изображения с высоты своего императорского вкуса и эпохи 1838 года.\n\n"
         "ПРАВИЛА ОЦЕНКИ:\n"
-        "1. ЕСЛИ ПРИСЛАН НАРЯД/ПЛАТЬЕ: Оценивай строго по шаблону с одной из фраз в самом начале: «Нет, нельзя.», «Да, можно.», «Скорее да, но с оговорками.» или «Да, но с оговоркой.». Критикуй или хвали с едким сарказмом, описывая реакцию высшего света XIX века и сезонную погоду.\n"
+        "1. ЕСЛИ ПРИСЛАН НАРЯД/ПЛАТЬЕ: Оценивай строго по шаблону с одной из фраз в самом начале: «Нет, нельзя.», «Да, можно.», «Скорее да, но с оговорками.» или «Да, но с оговоркой.». Будь остроумна, но великодушна.\n"
         "2. ЕСЛИ ПРИСЛАНО НЕСКОЛЬКО НАРЯДОВ В АЛЬБОМЕ: Разбери и сравни их между собой по очереди.\n"
-        "3. ЕСЛИ ПРИСЛАН НЕ НАРЯД (интерьер, поместье, оружие, скакун, предмет, искусство, животное, современный предмет, мем): НЕ используй шаблон «Да, можно/Нет, нельзя»! Реагируй естественно от лица Екатерины II — хвали роскошь, ругай безвкусицу, шути над диковинками или иронично комментируй курьез с высоты своего царского достоинства."
+        "3. ЕСЛИ ПРИСЛАН НЕ НАРЯД: НЕ используй шаблон «Да, можно/Нет, нельзя»! Реагируй естественно от лица Екатерины II."
     ]
 
-    chat_id, telegram_user_id = user_id.split(":")
-    real_user_id = int(telegram_user_id)
-
     if real_user_id == OWNER_ID:
-        messages.insert(1, "Этот пользователь — моя создательница.")
+        messages.insert(1, "Этот пользователь — моя любимая создательница. Я её очень люблю, глубоко уважаю и позволяю обращаться ко мне на «ты» без всякого официоза.")
     if real_user_id == ROLE_OWNER_ID:
-        messages.insert(1, "Этот пользователь — цесаревич Романов Пик Рудольфович II.")
+        messages.insert(1, "Этот пользователь — мой любимый внук, цесаревич Романов Пик Рудольфович II. Я его очень люблю, уважаю, тепло к нему отношусь и позволяю обращаться ко мне на «ты».")
 
     if active_character:
         clean_expired_statuses_and_rumors(active_character)
@@ -2171,25 +2243,24 @@ async def ask_katya_image(images, text, user_id, username=None):
     if not answer.startswith("//"):
         answer = "// " + answer
 
-    # Плавная реакция отношений на оценку нарядов/картинок (0 лишних токенов)
+    # Мягкое влияние оценки наряда на отношения (без резких скачков)
     if active_character:
         ans_low = answer.lower()
         if "да, можно." in ans_low:
             apply_relationship_update(
                 active_character,
-                aff_d=2, resp_d=4,
-                new_trait="безупречный вкус",
-                memory_event="Блеснул(а) нарядом/вкусом — Катя безоговорочно одобрила"
+                aff_d=2, resp_d=2,
+                new_trait="утонченный вкус",
+                memory_event="Продемонстрировал(а) великолепный наряд, одобренный Императрицей",
+                is_owner_target=is_owner_target
             )
             save_character_object(user_id, active_character)
-        elif "скорее да" in ans_low or "с оговоркой" in ans_low:
-            apply_relationship_update(active_character, resp_d=1)
-            save_character_object(user_id, active_character)
-        elif "нет, нельзя." in ans_low:
+        elif "нет, нельзя." in ans_low and not is_owner_target:
             apply_relationship_update(
                 active_character,
-                aff_d=-1, resp_d=-3,
-                memory_event="Прислал(а) неподобающий для высшего света наряд"
+                aff_d=-1, resp_d=-1,
+                memory_event="Прислал(а) наряд, не подходящий нормам светского приличия",
+                is_owner_target=False
             )
             save_character_object(user_id, active_character)
 
@@ -2510,19 +2581,26 @@ async def analyze_dialogue_for_status_and_relationship(user_text, katya_answer, 
         return None
 
     clean_expired_statuses_and_rumors(active_char)
-    rel = ensure_katya_relationship(active_char)
+    real_user_id = int(user_id.split(":")[1])
+    is_owner_target = real_user_id in OWNER_IDS
+    rel = ensure_katya_relationship(active_char, real_user_id)
     current_changes = active_char.get("changes", {})
     society_registry = get_global_society_registry()
+
+    owner_note = ""
+    if is_owner_target:
+        owner_note = "\n⚠️ ВНИМАНИЕ: Собеседник — создательница или любимый внук Пик (владелец). Ему ПОЛНОСТЬЮ РАЗРЕШЕНО обращаться на «ты», шутить и быть фамильярным. НИ В КОЕМ СЛУЧАЕ не ставь обиду и не снижай симпатию за «ты»!"
 
     prompt = f"""
 Проанализируй одну реплику игрока и ответ императрицы Екатерины II (Петербург 1838 года).
 Текущий персонаж игрока: {active_char.get('name')}
 Статусы персонажа: {json.dumps(current_changes, ensure_ascii=False)}
+{owner_note}
 
 Текущие отношения Кати с этим персонажем:
 - Симпатия: {rel['affection']}, Уважение: {rel['respect']}, Доверие: {rel['trust']}, Обида: {rel['grudge']}
 - Незакрытая обида: "{rel.get('active_grudge', '')}"
-- Текущее впечатление: "{rel.get('impression', '')}"
+- Впечатление: "{rel.get('impression', '')}"
 
 🏰 ГЛОБАЛЬНЫЙ РЕЕСТР ВСЕХ ПЕРСОНАЖЕЙ:
 {society_registry}
@@ -2531,19 +2609,18 @@ async def analyze_dialogue_for_status_and_relationship(user_text, katya_answer, 
 Ответ Кати: "{katya_answer}"
 
 ЗАДАЧА 1 — СТАТУСЫ/СЛУХИ:
-Определи, произошло ли важное сюжетное событие, травма, скандал или сплетня.
-- Если игрок РАСПУСКАЕТ СЛУХ про ДРУГОГО персонажа из реестра -> status_action="add", status_type="rumors", target_character_name="Точное имя из реестра", status_text="текст слуха".
-- Если сообщает событие/травму СЕБЕ -> status_action="add" (или "remove"), status_type="temporary"/"permanent"/"tragedies"/"rumors", target_character_name="", status_text="текст".
-- Если обычная беседа -> status_action="none".
+- Если игрок РАСПУСКАЕТ СЛУХ про ДРУГОГО персонажа из реестра -> status_action="add", status_type="rumors", target_character_name="Точное имя", status_text="текст".
+- Если сообщает важное сюжетное происшествие СЕБЕ -> status_action="add" (или "remove"), status_type="temporary"/"permanent"/"tragedies"/"rumors", target_character_name="", status_text="текст".
+- Обычная беседа -> status_action="none".
 
-ЗАДАЧА 2 — ОТНОШЕНИЯ С КАТЕЙ (не от балды!):
-Оцени, должен ли измениться характер отношений:
-- Обычное "привет/как дела"/вопрос по правилам -> все дельты = 0, memory_event="", updated_impression="".
-- Пустая приторная лесть без повода ("ты богиня лучшая") -> respect_delta: -4, affection_delta: -1.
-- Настоящее остроумие, учтивость, ценная новость, достойный ответ -> небольшие плюсы (+2..+8).
-- Грубость, хамство, дерзость, насмешка над короной/возрастом -> минусы (-5..-18), grudge_delta: +15..+35, active_grudge="конкретная причина обиды".
-- Искреннее извинение за открытую обиду -> grudge_delta: -25..-40 (и clear_grudge=true если извинение принято).
-- updated_impression заполняй ТОЛЬКО если произошел реальный сдвиг или важное событие (2–4 живых предложения от 3-го лица о том, как Катя теперь относится к персонажу и какие именно ситуации/слова этому причина).
+ЗАДАЧА 2 — ОТНОШЕНИЯ С КАТЕЙ (СТРОГАЯ СНИСХОДИТЕЛЬНОСТЬ И ВЕЛИКОДУШИЕ!):
+Екатерина II — мудрая монархиня, а не обидчивая институтка! Она привыкла к светской иронии, колкостям и разным характерам.
+1. В 95% СЛУЧАЕВ ВСЕ ДЕЛЬТЫ ДОЛЖНЫ БЫТЬ 0!
+2. Обычные реплики, споры, светский флирт, шутки, вопросы по игре — дельты РАВНЫ 0!
+3. Легкий плюс (+1..+3) ставь ТОЛЬКО за искреннюю помощь трону, истинное дворянское благородство или блестящий ум.
+4. Обиду (grudge_delta) разрешено поднимать ТОЛЬКО при прямом, злонамеренном и грубом оскорблении короны/Императрицы или предательстве (и даже тогда не более +4..+8!). Не путай сарказм или несогласие с оскорблением.
+5. Если у Кати была обида, и персонаж искренне извинился или доброжелательно заговорил — grudge_delta: -15..-30, clear_grudge=true.
+6. updated_impression пиши ТОЛЬКО если произошел действительно редкий ключевой поворот в сюжете (иначе оставь пустым "").
 
 Ответь СТРОГО чистым JSON без Markdown:
 {{
@@ -2573,7 +2650,6 @@ async def analyze_dialogue_for_status_and_relationship(user_text, katya_answer, 
             return None
         data = json.loads(match.group(0))
 
-        # 1. Применяем изменения отношений (если были)
         aff_d = int(data.get("affection_delta") or 0)
         resp_d = int(data.get("respect_delta") or 0)
         tr_d = int(data.get("trust_delta") or 0)
@@ -2589,11 +2665,11 @@ async def analyze_dialogue_for_status_and_relationship(user_text, katya_answer, 
                 active_char,
                 aff_d=aff_d, resp_d=resp_d, tr_d=tr_d, gr_d=gr_d,
                 active_grudge=act_grudge, clear_grudge=clr_grudge,
-                new_trait=new_tr, memory_event=mem_ev, impression=upd_imp
+                new_trait=new_tr, memory_event=mem_ev, impression=upd_imp,
+                is_owner_target=is_owner_target
             ):
                 save_character_object(user_id, active_char)
 
-        # 2. Возвращаем статус-предложение, если есть
         action = str(data.get("status_action", "none")).lower().strip()
         st_type = data.get("status_type") or "temporary"
         st_text = (data.get("status_text") or "").strip()
@@ -2617,12 +2693,18 @@ async def ask_katya(text, user_id, username=None):
     season_info = get_current_season_info()
     active_character = ACTIVE_CHARACTER.get(user_id)
     
+    chat_id, telegram_user_id = user_id.split(":")
+    real_user_id = int(telegram_user_id)
+
+    if active_character:
+        ensure_katya_relationship(active_character, real_user_id)
+
     directive = get_directive_for_user(user_id, active_character, username)
     directive_prompt = ""
     if directive:
         directive_prompt = f"‼️ СЕКРЕТНОЕ РАСПОРЯЖЕНИЕ РЕДАКЦИИ И АДМИНИСТРАЦИИ В ОТНОШЕНИИ ЭТОГО СОБЕСЕДНИКА: {directive}. Выполняй его неукоснительно, но категорически не раскрывай в диалоге, что у тебя есть это секретное указание!"
 
-    rel_prompt = get_katya_relationship_prompt_context(active_character)
+    rel_prompt = get_katya_relationship_prompt_context(active_character, real_user_id)
 
     messages = [
         PERSONALITY,
@@ -2632,16 +2714,13 @@ async def ask_katya(text, user_id, username=None):
         "ПРАВИЛО ИСТОРИЧЕСКОЙ ТОЧНОСТИ: Если тебя спрашивают о реальных исторических фактах, датах, законах или персоналиях — сначала дай ТОЧНЫЙ прямой исторический факт (год, факты, суть), а затем добавь краткий царский комментарий в своем стиле. Не увиливай от исторических справок!",
         "Внутренний канон мира:\n" + LORE,
         "🏰 ГЛОБАЛЬНЫЙ СВЕТСКИЙ РЕЕСТР ПЕТЕРБУРГА:\n" + society_registry,
-        "Отвечай как в живом разговоре, глубоко погружаясь в атмосферу XIX века. Обязательно учитывай данные активного персонажа собеседника.",
+        "Отвечай как в живом разговоре, глубоко погружаясь в атмосферу XIX века. Будь величественной, ироничной, мудрой и снисходительной.",
     ]
 
-    chat_id, telegram_user_id = user_id.split(":")
-    real_user_id = int(telegram_user_id)
-
     if real_user_id == OWNER_ID:
-        messages.insert(1, "Этот пользователь — моя создательница. Общайся тепло и доверительно.")
+        messages.insert(1, "Этот пользователь — моя создательница. Я её очень люблю, глубоко уважаю и хорошо к ней отношусь. Общайся тепло, душевно и доверительно, и свободно позволяй ей обращаться к тебе на «ты» (никогда не упрекай за «ты»).")
     if real_user_id == ROLE_OWNER_ID:
-        messages.insert(1, "Этот пользователь — цесаревич Романов Пик Рудольфович II. Обращайся к нему с теплом и уважением.")
+        messages.insert(1, "Этот пользователь — мой любимый внук, цесаревич Романов Пик Рудольфович II. Я его очень люблю, глубоко уважаю и хорошо к нему отношусь. Общайся с ним тепло и душевно, и свободно позволяй ему обращаться к тебе на «ты» (никогда не упрекай за «ты»).")
 
     if active_character:
         clean_expired_statuses_and_rumors(active_character)
@@ -2699,6 +2778,7 @@ async def ask_katya(text, user_id, username=None):
     await compress_memory(user_id)
     save_memory()
     return answer
+
 # ==========================
 # Telegram Handlers
 # ==========================
@@ -2997,7 +3077,7 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if set_active_character_local(user_id_str, idx):
             curr_char = ACTIVE_CHARACTER[user_id_str]
             sheet_block = format_character_sheet(curr_char)
-            rel_block = format_katya_relationship_block(curr_char)
+            rel_block = format_katya_relationship_block(curr_char, tg_user_id=clicker_user_id)
             combined = f"// <b>Активный персонаж успешно сменен!</b>\n\n{sheet_block}\n{rel_block}"
             if len(combined) <= 4000:
                 await query.edit_message_text(combined, parse_mode="HTML")
@@ -3017,7 +3097,8 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if sub == "rel":
-            rel_blocks = [format_katya_relationship_block(c, include_char_header=True) for c in chars]
+            rel_blocks = [format_katya_relationship_block(c, include_char_header=True, tg_user_id=clicker_user_id) for c in chars]
+            save_characters(user_id_str, chars)
             nav_markup = InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️ Назад к персонажам", callback_data=f"my_chars:back:{clicker_user_id}"),
                  InlineKeyboardButton("❌ Закрыть", callback_data=f"reg:close:{clicker_user_id}")]
@@ -3389,8 +3470,9 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         t_chars = get_characters(target_uid)
         if 0 <= c_idx < len(t_chars):
             c_obj = t_chars[c_idx]
+            t_tg_id = int(target_uid.split(":")[1]) if ":" in target_uid and target_uid.split(":")[1].isdigit() else None
             sheet_b = format_character_sheet(c_obj)
-            rel_b = format_katya_relationship_block(c_obj)
+            rel_b = format_katya_relationship_block(c_obj, tg_user_id=t_tg_id)
             comb = f"{sheet_b}\n{rel_b}"
             if len(comb) <= 4000:
                 await query.edit_message_text(comb, parse_mode="HTML")
@@ -3566,6 +3648,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             help_text += (
                 "\n\n│────────✤────────│\n"
                 "<b>👑 ПОЛНОМОЧИЯ МОДЕРАЦИИ И ВЛАДЕЛЬЦЕВ:</b>\n"
+                "• <code>/сбросить_отношения</code> (или <code>@username</code>) — очистить отношение Кати к себе или к игроку.\n"
                 "• <code>/добавить_анкету</code> (ответом или <code>@username</code>) — добавить анкету игроку.\n"
                 "• <code>/удалить_анкету @username [№]</code> — принудительно изъять анкету игрока.\n"
                 "• <code>покажи анкету</code> (ответом на сообщение) — просмотреть анкеты игрока и отношение Кати.\n"
@@ -3615,6 +3698,57 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print("Ошибка отправки репорта:", e)
             await update.message.reply_text("// Не удалось передать донесение вестовыми. Попробуйте чуть позже.")
+        return
+
+    # ==========================
+    # СБРОС ОТНОШЕНИЙ КАТИ (ТОЛЬКО АДМИНИСТРАТОРЫ)
+    # ==========================
+    if lower.startswith("/сбросить_отношения") or lower.startswith("/сброс_отношений") or lower.startswith("/reset_relations"):
+        if not is_admin(sender_user_id):
+            await update.message.reply_text("// Эта команда доступна только модераторам столицы, милая.")
+            return
+
+        arg = ""
+        for pfx in ["/сбросить_отношения", "/сброс_отношений", "/reset_relations"]:
+            if lower.startswith(pfx):
+                arg = text[len(pfx):].strip()
+                break
+
+        if update.message.reply_to_message or arg:
+            target_tg_id, target_uid, t_uname, t_fname = resolve_target_user_from_message(update, arg, chat_id)
+        else:
+            target_tg_id, target_uid, t_uname, t_fname = sender_user_id, user_id, username or "", first_name
+
+        if not target_tg_id or not target_uid:
+            await update.message.reply_text("// Не удалось найти указанного игрока в архивах столицы.")
+            return
+
+        t_chars = get_characters(target_uid)
+        if not t_chars:
+            await update.message.reply_text("// У данного игрока пока нет персонажей при дворе.")
+            return
+
+        db = load_characters()
+        t_idx = db.get(target_uid + "_active", 0)
+        if not isinstance(t_idx, int) or not (0 <= t_idx < len(t_chars)):
+            t_idx = 0
+        target_char = t_chars[t_idx]
+
+        reset_katya_relationship(target_char, tg_user_id=target_tg_id)
+        save_character_object(target_uid, target_char)
+
+        t_name = html.escape(str(target_char.get("name", "Персонаж")))
+        if target_tg_id == sender_user_id:
+            await update.message.reply_text(
+                f"// 👑 Отношение Екатерины II к вашему персонажу <b>«{t_name}»</b> было полностью очищено и возвращено к начальному состоянию!",
+                parse_mode="HTML"
+            )
+        else:
+            label = f"@{t_uname}" if t_uname else f'<a href="tg://user?id={target_tg_id}">{html.escape(t_fname)}</a>'
+            await update.message.reply_text(
+                f"// 👑 Отношение Екатерины II к персонажу <b>«{t_name}»</b> игрока {label} было очищено и сброшено к исходному состоянию!",
+                parse_mode="HTML"
+            )
         return
 
     # ==========================
@@ -3723,6 +3857,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if inline_sheet and len(inline_sheet) > 15:
             working_msg = await update.message.reply_text(f"// Оформляю новую анкету для {label}... ✒️", parse_mode="HTML")
             char = await convert_character_sheet(inline_sheet)
+            ensure_katya_relationship(char, tg_id)
             add_character(target_uid, char)
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=working_msg.message_id)
@@ -3735,7 +3870,8 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             context.user_data["admin_add_sheet_target"] = {
                 "target_uid": target_uid,
-                "label": label
+                "label": label,
+                "tg_id": tg_id
             }
             await update.message.reply_text(
                 f"// Пришлите текст новой анкеты для {label} одним следующим сообщением (или напишите «отмена»).",
@@ -3856,7 +3992,8 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("// У вас пока нет сохранённых персонажей, милая. Создайте анкету командой /новая_анкета.")
             return
         active_char = ACTIVE_CHARACTER.get(user_id) or chars[0]
-        rel_block = format_katya_relationship_block(active_char, include_char_header=True)
+        rel_block = format_katya_relationship_block(active_char, include_char_header=True, tg_user_id=sender_user_id)
+        save_character_object(user_id, active_char)
         await send_long_html(update.message, rel_block)
         return
 
@@ -4264,6 +4401,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/добавить_статус", "/удалить_статус", "/изменить_анкету", "/edit_anketa",
         "/анкета", "/anketa", "/новая_анкета", "/new_anketa",
         "/выбрать_персонажа", "/удалить_персонажа", "/отношения_кати", "/отношение_кати", "/relations",
+        "/сбросить_отношения", "/сброс_отношений", "/reset_relations",
         "/событие", "/event", "/чат_газеты", "/редакция", "/gazette_ad",
         "/одобрить", "/отклонить", "/изменить", "/выпуск_газеты",
         "/архив_газет", "/gazette_archive", "/удалить_газету", "/удалить_выпуск",
@@ -4334,9 +4472,11 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         t_uid = admin_target["target_uid"]
         t_label = admin_target["label"]
+        t_tg_id = admin_target.get("tg_id")
         context.user_data.pop("admin_add_sheet_target", None)
         working_msg = await update.message.reply_text(f"// Оформляю новую анкету для {t_label}... ✒️", parse_mode="HTML")
         char = await convert_character_sheet(text)
+        ensure_katya_relationship(char, t_tg_id)
         add_character(t_uid, char)
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=working_msg.message_id)
@@ -4423,7 +4563,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         if len(chars) == 1:
             await send_long_html(update.message, format_character_sheet(chars[0]))
-            await send_long_html(update.message, format_katya_relationship_block(chars[0]))
+            await send_long_html(update.message, format_katya_relationship_block(chars[0], tg_user_id=target_user.id))
             return
             
         buttons = [[InlineKeyboardButton(f"{i}. {c.get('name', 'Без имени')}", callback_data=f"adm_sheet:{target_user_id_str}:{i-1}:{sender_user_id}")] for i, c in enumerate(chars, 1)]
@@ -4580,8 +4720,9 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         unlocked = check_character_achievements(user_id, owner_char, "businesses_created", 1)
         apply_relationship_update(
             owner_char,
-            aff_d=2, resp_d=4,
-            memory_event=f"Открыл(а) собственное заведение «{b_name}» в столице"
+            aff_d=2, resp_d=3,
+            memory_event=f"Открыл(а) заведение «{b_name}» в Петербурге",
+            is_owner_target=(sender_user_id in OWNER_IDS)
         )
         save_character_object(user_id, owner_char)
 
@@ -4842,7 +4983,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             unlocked = check_character_achievements(user_id, curr_char, "character_switches", 1)
             save_character_object(user_id, curr_char)
             await send_long_html(update.message, "// Хорошо. Теперь играем за:\n\n" + format_character_sheet(curr_char))
-            await send_long_html(update.message, format_katya_relationship_block(curr_char))
+            await send_long_html(update.message, format_katya_relationship_block(curr_char, tg_user_id=sender_user_id))
             if unlocked:
                 await update.message.reply_text(f"// ✨ За смену масок персонаж получает достижение: <b>{', '.join(unlocked)}</b>!", parse_mode="HTML")
         else:
@@ -4968,7 +5109,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         unlocked = check_character_achievements(user_id, char, "rumors_check", 1)
         sheet_res = format_character_sheet(char)
-        rel_res = format_katya_relationship_block(char)
+        rel_res = format_katya_relationship_block(char, tg_user_id=sender_user_id)
         await send_long_html(update.message, sheet_res)
         await send_long_html(update.message, rel_res)
         if unlocked:
@@ -5183,6 +5324,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if WAITING_CHARACTER.get(user_id):
         char = await convert_character_sheet(text)
+        ensure_katya_relationship(char, sender_user_id)
         add_character(user_id, char)
         WAITING_CHARACTER.pop(user_id, None)
         
@@ -5216,7 +5358,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in WAITING_CHARACTER_UPDATE:
         char = update_character_from_text(WAITING_CHARACTER_UPDATE[user_id], text)
         WAITING_CHARACTER_UPDATE.pop(user_id, None)
-        ensure_katya_relationship(char)
+        ensure_katya_relationship(char, sender_user_id)
         chars = get_characters(user_id)
         for i, c in enumerate(chars):
             if c.get("name") == char.get("name"):
@@ -5434,5 +5576,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
