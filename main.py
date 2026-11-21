@@ -2584,6 +2584,18 @@ ALLOWED_KATYA_REACTIONS = {
 async def analyze_dialogue_for_status_and_relationship(user_text, katya_answer, user_id):
     active_char = ACTIVE_CHARACTER.get(user_id)
     if not active_char:
+        u_low = (user_text or "").lower()
+        if any(w in u_low for w in ["реакц", "лайк", "сердеч", "огон", "эмодзи"]):
+            for em in ALLOWED_KATYA_REACTIONS:
+                if em in user_text:
+                    return {"status": None, "reaction": em}
+            if any(w in u_low for w in ["сердеч", "любл", "❤️"]):
+                return {"status": None, "reaction": "❤️"}
+            if any(w in u_low for w in ["огон", "🔥"]):
+                return {"status": None, "reaction": "🔥"}
+            if "лайк" in u_low or "👍" in u_low:
+                return {"status": None, "reaction": "👍"}
+            return {"status": None, "reaction": "💅"}
         return None
 
     clean_expired_statuses_and_rumors(active_char)
@@ -2629,9 +2641,8 @@ async def analyze_dialogue_for_status_and_relationship(user_text, katya_answer, 
 6. updated_impression пиши ТОЛЬКО если произошел действительно редкий ключевой поворот в сюжете (иначе оставь пустым "").
 
 ЗАДАЧА 3 — ОСОЗНАННАЯ ЭМОДЗИ-РЕАКЦИЯ НА СООБЩЕНИЕ ИГРОКА:
-Иногда (примерно в 20–30% случаев, НЕ на каждое сообщение!) Катя может поставить эмодзи-реакцию на сообщение собеседника:
-- На обычную рутину/вопросы/спокойный текст -> null (без реакции!).
-- Ставь эмодзи ТОЛЬКО при яркой эмоции, выбирая строго из разрешённых:
+- Если собеседник ПРЯМО ПРОСИТ поставить реакцию или эмодзи (например: «поставь реакцию», «поставь сердечко/лайк/огонь», «оцени реакцией») — ОБЯЗАТЕЛЬНО выбери подходящий эмодзи из списка (не ставь null!). Если попросил конкретный эмодзи из списка — поставь именно его.
+- В остальных случаях ставь реакцию лишь иногда (примерно в 20–30% случаев при яркой эмоции, на обычную рутину/вопросы -> null):
   * Любовь, теплота, похвала, нежность, восторг: "❤️", "🥰", "👏", "💅", "🍾", "🏆"
   * Остроумие, смех, интересная сплетня, впечатляющая деталь: "🤣", "🔥", "👀", "🎉"
   * Насмешка, недоумение, дерзость, скука, недовольство: "🤨", "😐", "🥱", "👎", "⚡", "🗿"
@@ -2734,6 +2745,7 @@ async def ask_katya(text, user_id, username=None):
         rel_prompt,
         f"🗓️ ФОНОВЫЕ ЗНАНИЯ О МИРЕ (1838 ГОД): {season_info}. Это твое внутреннее знание об обстановке, погоде и времени суток. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО называть дату, год, день недели или время суток сама по себе, если пользователь прямо не спросил: «Какое сегодня число/время?»",
         "ПРАВИЛО ИСТОРИЧЕСКОЙ ТОЧНОСТИ: Если тебя спрашивают о реальных исторических фактах, датах, законах или персоналиях — сначала дай ТОЧНЫЙ прямой исторический факт (год, факты, суть), а затем добавь краткий царский комментарий в своем стиле. Не увиливай от исторических справок!",
+        "УМЕНИЕ СТАВИТЬ РЕАКЦИИ: Ты умеешь ставить эмодзи-реакции в Telegram на сообщения собеседников (система делает это за тебя). Если тебя просят поставить реакцию — отвечай в образе (создательнице и внуку Пику соглашайся с радостью и теплом, остальным — по настроению), но никогда не говори, что технически не умеешь этого.",
         "Внутренний канон мира:\n" + LORE,
         "🏰 ГЛОБАЛЬНЫЙ СВЕТСКИЙ РЕЕСТР ПЕТЕРБУРГА:\n" + society_registry,
         "Отвечай как в живом разговоре, глубоко погружаясь в атмосферу XIX века. Будь величественной, ироничной, мудрой и снисходительной.",
@@ -2805,6 +2817,22 @@ async def ask_katya(text, user_id, username=None):
 # Telegram Handlers
 # ==========================
 
+def pick_outfit_reaction(answer, caption=""):
+    """Подбирает реакцию Кати на наряд/фото по её вердикту (без лишних запросов к ИИ)."""
+    ans_low = (answer or "").lower()
+    cap_low = (caption or "").lower()
+    asked = any(w in cap_low for w in ["реакц", "лайк", "сердеч", "оцени", "эмодзи", "огонь"])
+
+    if "да, можно." in ans_low:
+        return random.choice(["❤️", "💅", "🔥", "👏", "😍", "🏆"])
+    if "скорее да" in ans_low or "с оговоркой" in ans_low or "с оговорками" in ans_low:
+        return "👌" if asked else random.choice(["👌", "🤔", "💅", None])
+    if "нет, нельзя." in ans_low:
+        return random.choice(["🤨", "👎", "🥱", "🤡", "🗿"])
+    if asked or random.random() < 0.35:
+        return random.choice(["👀", "❤️", "🔥", "💅"])
+    return None
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("// Я Екатерина II. Готова помочь вам в нашей ролевой. Нажмите /help чтобы увидеть все команды.")
 
@@ -2870,6 +2898,13 @@ async def process_media_album_buffer(media_group_id, chat_id, user_id, username,
             await target_msg.reply_text(f"// ✨ За ваше утонченное чувство стиля персонаж получает тайное достижение: <b>{', '.join(unlocked)}</b>!", parse_mode="HTML")
 
     answer = await ask_katya_image(images, caption, user_id, username)
+    outfit_react = pick_outfit_reaction(answer, caption)
+    if outfit_react and target_msg:
+        try:
+            await target_msg.set_reaction([ReactionTypeEmoji(outfit_react)])
+        except Exception as e:
+            print("Не удалось поставить реакцию на альбом:", e)
+
     if target_msg:
         await target_msg.reply_text(answer)
     else:
@@ -2935,6 +2970,13 @@ async def photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"// ✨ За ваше утонченное чувство стиля персонаж получает тайное достижение: <b>{', '.join(unlocked)}</b>!", parse_mode="HTML")
 
     answer = await ask_katya_image(image, caption, user_id, username)
+    outfit_react = pick_outfit_reaction(answer, caption)
+    if outfit_react:
+        try:
+            await update.message.set_reaction([ReactionTypeEmoji(outfit_react)])
+        except Exception as e:
+            print("Не удалось поставить реакцию на фото:", e)
+
     await update.message.reply_text(answer)
 
 async def convert_character_sheet(text):
@@ -3616,7 +3658,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     is_private = update.effective_chat.type == "private"
 
-    # Очищаем @username_бота из /команда@бот в групповых чатах
+    # Очищаем @username_бота из /команда@бот в групповых чатах для мгновенного выполнения
     if text.startswith("/"):
         parts_cmd = text.split(None, 1)
         clean_cmd = re.sub(r'@[a-zA-Z0-9_]+$', '', parts_cmd[0])
@@ -4561,7 +4603,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"участвовать в светской жизни Петербурга, необходимо составить анкету "
                         f"и представить себя ко двору. Создайте персонажа (/новая_анкета), чтобы я знала, как с вами общаться!"
                     )
-                    return
+                    return 
             else:
                 db = load_characters()
                 idx_act = db.get(user_id + "_active", 0)
