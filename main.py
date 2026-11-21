@@ -1,4 +1,3 @@
-
 import itertools
 import re
 import io
@@ -20,6 +19,7 @@ from telegram import (
     BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReactionTypeEmoji,
 )
 from telegram.error import NetworkError, TimedOut, Conflict, TelegramError
 from telegram.ext import (
@@ -767,7 +767,7 @@ async def generate_roleplay_advice(user_query, active_char, user_id, chat_id):
 • <b>Поражение/Неудача:</b> Как отыграть проигрыш или конфуз зрелищно и сохранить честь.</blockquote>
 
 <blockquote>🕵️‍♂️ <b>5. Тайные уловки и шулерство:</b>
-<tg-spoiler>(ОБЯЗАТЕЛЬНО оберни сам текст хитрости в тег tg-spoiler: как в этом деле мухлевали или обходили правила в 1838 году: сигналы веером, подкуп слуг, фальшивые векселя, крапленые колоды, шелковые платки от пуль и т.д.)</tg-spoiler></blockquote>
+<tg-spoiler>(ОБЯЗАЛЬНО оберни сам текст хитрости в тег tg-spoiler: как в этом деле мухлевали или обходили правила в 1838 году: сигналы веером, подкуп слуг, фальшивые векселя, крапленые колоды, шелковые платки от пуль и т.д.)</tg-spoiler></blockquote>
 
 <blockquote>🚫 <b>6. ТАБУ И ЗАПРЕТЫ:</b>
 (Строгий список 2-3 вещей, категорически запрещенных в этой сцене: сленг, Powergaming, несоответствие дворянскому этикету 1838 года).</blockquote>
@@ -2572,8 +2572,14 @@ async def generate_roleplay_event(char_list_str, theme):
     return event_text, is_success, is_duel_conflict
 
 # ==========================
-# Совмещенный анализ диалога: Статусы + Живые отношения с Катей (MODEL_LITE)
+# Совмещенный анализ диалога: Статусы + Живые отношения с Катей + Реакции (MODEL_LITE)
 # ==========================
+
+ALLOWED_KATYA_REACTIONS = {
+    "👍", "👎", "❤️", "🔥", "👏", "🤔", "🤯", "😱", "🤬", "😢",
+    "🎉", "🤩", "🙏", "👌", "🤡", "🥱", "🥴", "😍", "🤣", "⚡",
+    "🏆", "💔", "🤨", "😐", "🍾", "💅", "🗿", "👀", "😇", "🥰"
+}
 
 async def analyze_dialogue_for_status_and_relationship(user_text, katya_answer, user_id):
     active_char = ACTIVE_CHARACTER.get(user_id)
@@ -2622,6 +2628,15 @@ async def analyze_dialogue_for_status_and_relationship(user_text, katya_answer, 
 5. Если у Кати была обида, и персонаж искренне извинился или доброжелательно заговорил — grudge_delta: -15..-30, clear_grudge=true.
 6. updated_impression пиши ТОЛЬКО если произошел действительно редкий ключевой поворот в сюжете (иначе оставь пустым "").
 
+ЗАДАЧА 3 — ОСОЗНАННАЯ ЭМОДЗИ-РЕАКЦИЯ НА СООБЩЕНИЕ ИГРОКА:
+Иногда (примерно в 20–30% случаев, НЕ на каждое сообщение!) Катя может поставить эмодзи-реакцию на сообщение собеседника:
+- На обычную рутину/вопросы/спокойный текст -> null (без реакции!).
+- Ставь эмодзи ТОЛЬКО при яркой эмоции, выбирая строго из разрешённых:
+  * Любовь, теплота, похвала, нежность, восторг: "❤️", "🥰", "👏", "💅", "🍾", "🏆"
+  * Остроумие, смех, интересная сплетня, впечатляющая деталь: "🤣", "🔥", "👀", "🎉"
+  * Насмешка, недоумение, дерзость, скука, недовольство: "🤨", "😐", "🥱", "👎", "⚡", "🗿"
+  * Шок, драма, печальная весть: "🤯", "😱", "💔", "😢"
+
 Ответь СТРОГО чистым JSON без Markdown:
 {{
   "status_action": "none",
@@ -2636,7 +2651,8 @@ async def analyze_dialogue_for_status_and_relationship(user_text, katya_answer, 
   "clear_grudge": false,
   "new_trait": "",
   "memory_event": "",
-  "updated_impression": ""
+  "updated_impression": "",
+  "reaction": null
 }}
 """
     raw, err_msg = await generate_gemini_text_safe(prompt, model_name=MODEL_LITE)
@@ -2670,19 +2686,25 @@ async def analyze_dialogue_for_status_and_relationship(user_text, katya_answer, 
             ):
                 save_character_object(user_id, active_char)
 
+        raw_reaction = data.get("reaction")
+        reaction_emoji = str(raw_reaction).strip() if raw_reaction else None
+        if reaction_emoji not in ALLOWED_KATYA_REACTIONS:
+            reaction_emoji = None
+
         action = str(data.get("status_action", "none")).lower().strip()
         st_type = data.get("status_type") or "temporary"
         st_text = (data.get("status_text") or "").strip()
         target_name = (data.get("target_character_name") or "").strip()
 
+        status_res = None
         if action in ["add", "remove"] and st_text:
-            return {
+            status_res = {
                 "action": action,
                 "type": st_type,
                 "status_text": st_text,
                 "target_character_name": target_name
             }
-        return None
+        return {"status": status_res, "reaction": reaction_emoji}
     except Exception as e:
         print("Ошибка анализа статусов и отношений:", e)
         return None
@@ -3465,20 +3487,32 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 8. КНОПКИ ВЫБОРА ПЕРСОНАЖА ДЛЯ МОДЕРАТОРОВ (покажи анкету)
     if action_prefix == "adm_sheet":
-        target_uid = parts[1]
-        c_idx = int(parts[2])
+        if len(parts) >= 5:
+            target_uid = f"{parts[1]}:{parts[2]}"
+            c_idx = int(parts[3])
+            t_tg_id = int(parts[2]) if parts[2].lstrip("-").isdigit() else None
+        else:
+            target_uid = parts[1]
+            c_idx = int(parts[2])
+            t_tg_id = int(target_uid.split(":")[1]) if ":" in target_uid and target_uid.split(":")[1].isdigit() else None
+
         t_chars = get_characters(target_uid)
         if 0 <= c_idx < len(t_chars):
             c_obj = t_chars[c_idx]
-            t_tg_id = int(target_uid.split(":")[1]) if ":" in target_uid and target_uid.split(":")[1].isdigit() else None
             sheet_b = format_character_sheet(c_obj)
             rel_b = format_katya_relationship_block(c_obj, tg_user_id=t_tg_id)
             comb = f"{sheet_b}\n{rel_b}"
-            if len(comb) <= 4000:
-                await query.edit_message_text(comb, parse_mode="HTML")
-            else:
-                await query.edit_message_text(sheet_b, parse_mode="HTML")
-                await context.bot.send_message(chat_id=chat_id, text=rel_b, parse_mode="HTML")
+            try:
+                if len(comb) <= 4000:
+                    await query.edit_message_text(comb, parse_mode="HTML")
+                else:
+                    await query.edit_message_text(sheet_b, parse_mode="HTML")
+                    await context.bot.send_message(chat_id=chat_id, text=rel_b, parse_mode="HTML")
+            except Exception:
+                await send_long_html(query.message, sheet_b)
+                await send_long_html(query.message, rel_b)
+        else:
+            await query.edit_message_text("// Анкета этого персонажа не найдена.")
         return
 
     # 9. КНОПКИ ВЫБОРА АВТОРА ДЛЯ /письмо (С ШАБЛОНОМ)
@@ -3581,6 +3615,14 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lower = text.lower().strip()
     chat_id = update.effective_chat.id
     is_private = update.effective_chat.type == "private"
+
+    # Очищаем @username_бота из /команда@бот в групповых чатах
+    if text.startswith("/"):
+        parts_cmd = text.split(None, 1)
+        clean_cmd = re.sub(r'@[a-zA-Z0-9_]+$', '', parts_cmd[0])
+        if clean_cmd != parts_cmd[0]:
+            text = clean_cmd + (" " + parts_cmd[1] if len(parts_cmd) > 1 else "")
+            lower = text.lower().strip()
 
     if username:
         USERNAME_CACHE["@" + username.lower()] = user_id
@@ -3981,6 +4023,23 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "// Ваши персонажи двора. Нажмите на кнопку, чтобы играть за выбранного:",
             reply_markup=get_my_chars_markup(chars, sender_user_id)
         )
+        return
+
+    # ==========================
+    # РЕЕСТР (ИНТЕРАКТИВНЫЙ С КНОПКАМИ, МГНОВЕННО)
+    # ==========================
+    if lower in ["/реестр", "/reestr", "катя реестр", "катя, реестр"]:
+        await update.message.reply_text(
+            "// <b>🏛️ Императорский Реестр Санкт-Петербурга (1838)</b>\n"
+            "Выберите, какие архивы желаете осмотреть:",
+            reply_markup=get_registry_menu_markup(sender_user_id),
+            parse_mode="HTML"
+        )
+        return
+
+    if lower in ["список бизнесов", "катя список бизнесов"]:
+        text_out, markup = build_registry_businesses_page(sender_user_id, page=0)
+        await update.message.reply_text(text_out, reply_markup=markup, parse_mode="HTML")
         return
 
     # ==========================
@@ -4492,18 +4551,18 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_creation_request = any(trigger in lower for trigger in creation_triggers)
 
     if not is_creation_request and user_id not in WAITING_CHARACTER:
-        chars = get_characters(user_id)
-        if not chars:
-            if (is_addressed_to_katya or is_reply or is_private) and not is_admin(sender_user_id):
-                await update.message.reply_text(
-                    f"// *Императорски смотрит на вас через лорнет* "
-                    f"Полноте, милая! Прежде чем вести со мной беседы или "
-                    f"участвовать в светской жизни Петербурга, необходимо составить анкету "
-                    f"и представить себя ко двору. Создайте персонажа (/новая_анкета), чтобы я знала, как с вами общаться!"
-                )
-                return 
-        else:
-            if user_id not in ACTIVE_CHARACTER or not ACTIVE_CHARACTER[user_id]:
+        if user_id not in ACTIVE_CHARACTER or not ACTIVE_CHARACTER[user_id]:
+            chars = get_characters(user_id)
+            if not chars:
+                if (is_addressed_to_katya or is_reply or is_private) and not is_admin(sender_user_id):
+                    await update.message.reply_text(
+                        f"// *Императорски смотрит на вас через лорнет* "
+                        f"Полноте, милая! Прежде чем вести со мной беседы или "
+                        f"участвовать в светской жизни Петербурга, необходимо составить анкету "
+                        f"и представить себя ко двору. Создайте персонажа (/новая_анкета), чтобы я знала, как с вами общаться!"
+                    )
+                    return
+            else:
                 db = load_characters()
                 idx_act = db.get(user_id + "_active", 0)
                 if not isinstance(idx_act, int) or not (0 <= idx_act < len(chars)):
@@ -4572,23 +4631,8 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ==========================
-    # РЕЕСТР (ИНТЕРАКТИВНЫЙ С КНОПКАМИ) И ПРОСМОТР БИЗНЕСОВ
+    # ПРОСМОТР КОНКРЕТНОГО ЗАВЕДЕНИЯ И УПРАВЛЕНИЕ БИЗНЕСАМИ
     # ==========================
-
-    if lower in ["/реестр", "/reestr", "катя реестр", "катя, реестр"]:
-        await update.message.reply_text(
-            "// <b>🏛️ Императорский Реестр Санкт-Петербурга (1838)</b>\n"
-            "Выберите, какие архивы желаете осмотреть:",
-            reply_markup=get_registry_menu_markup(sender_user_id),
-            parse_mode="HTML"
-        )
-        return
-
-    if lower in ["список бизнесов", "катя список бизнесов"]:
-        text_out, markup = build_registry_businesses_page(sender_user_id, page=0)
-        await update.message.reply_text(text_out, reply_markup=markup, parse_mode="HTML")
-        return
-
     if lower.startswith("/заведение") or lower.startswith("катя заведение") or lower.startswith("катя, заведение"):
         parts = text.split(" ", 1)
         if len(parts) < 2 or not parts[1].strip():
@@ -5498,9 +5542,17 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_character_object(user_id, active_char)
 
     # ==========================
-    # АНАЛИЗ ДИАЛОГОВ: СТАТУСЫ/СЛУХИ + ЖИВЫЕ ОТНОШЕНИЯ С КАТЕЙ
+    # АНАЛИЗ ДИАЛОГОВ: СТАТУСЫ/СЛУХИ + ЖИВЫЕ ОТНОШЕНИЯ + РЕАКЦИИ КАТИ
     # ==========================
-    status_analysis = await analyze_dialogue_for_status_and_relationship(text, answer, user_id)
+    analysis_res = await analyze_dialogue_for_status_and_relationship(text, answer, user_id)
+    reaction_emoji = analysis_res.get("reaction") if isinstance(analysis_res, dict) else None
+    if reaction_emoji:
+        try:
+            await update.message.set_reaction([ReactionTypeEmoji(reaction_emoji)])
+        except Exception as e:
+            print("Не удалось поставить реакцию:", e)
+
+    status_analysis = analysis_res.get("status") if isinstance(analysis_res, dict) else None
     if status_analysis and status_analysis.get("action") in ["add", "remove"]:
         action = status_analysis.get("action")
         st_type = status_analysis.get("type", "temporary")
@@ -5576,3 +5628,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
