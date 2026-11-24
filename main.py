@@ -819,57 +819,120 @@ USED_SOURCES: 1, 2
                 sources_list.append((s['title'], s['url']))
 
     return answer_text, sources_list, None
-
 # ==========================
 # ХУДОЖЕСТВЕННАЯ МАСТЕРСКАЯ КАТИ (CLOUDFLARE FLUX + GEMINI ПРОМПТ)
 # ==========================
 
 CLOUDFLARE_IMAGE_URL = "https://dark-fire-6107.inetlesya.workers.dev/prompt/"
 
-async def build_art_prompt_with_ai(user_request, active_char=None):
-    """Превращает короткий запрос игрока в шикарный, детальный промпт для FLUX на английском."""
+def get_real_active_character(user_id, tg_user_id):
+    """Надёжно достаёт реального активного персонажа из памяти или базы (даже в ЛС и после рестарта)."""
+    if user_id in ACTIVE_CHARACTER and ACTIVE_CHARACTER[user_id]:
+        return ACTIVE_CHARACTER[user_id]
+    db = load_characters()
+    chars = db.get(user_id, [])
+    if chars:
+        idx = db.get(user_id + "_active", 0)
+        if not isinstance(idx, int) or not (0 <= idx < len(chars)):
+            idx = 0
+        ACTIVE_CHARACTER[user_id] = chars[idx]
+        return chars[idx]
+    suffix = f":{tg_user_id}"
+    for k, v in db.items():
+        if not k.endswith("_active") and k.endswith(suffix) and v:
+            idx = db.get(k + "_active", 0)
+            if not isinstance(idx, int) or not (0 <= idx < len(v)):
+                idx = 0
+            return v[idx]
+    return None
+
+def _name_in_text(full_name, text_low):
+    """Проверяет, упоминается ли имя персонажа в тексте (с учётом русских падежей)."""
+    for part in str(full_name or "").split():
+        p = part.lower().strip(".,!?«»\"'")
+        if len(p) < 3:
+            continue
+        stem = p[:-2] if len(p) >= 7 else (p[:-1] if len(p) >= 5 else p)
+        if stem in text_low:
+            return True
+    return False
+
+async def build_art_prompt_with_ai(user_request, active_char=None, chat_id=None):
+    """Глубоко перерабатывает запрос игрока в роскошный промпт для FLUX и обязательно вплетает внешность анкеты."""
+    req_low = user_request.lower()
+    self_triggers = [
+        "себя", "меня", "мне", "мной", "мой", "моя", "мое", "моё", "моего", "моей",
+        "персонаж", "геро", "анкет", "портрет", "свой", "свою", "своего", "своей",
+        "я ", " я", "я,", "собой"
+    ]
+    wants_self = any(w in req_low for w in self_triggers) or (active_char and _name_in_text(active_char.get("name"), req_low))
+
+    used_chars = []
+    if wants_self and active_char:
+        used_chars.append(("Персонаж игрока", active_char))
+
+    # Проверяем, не упомянут ли в запросе другой персонаж из ролевой этого чата
+    if chat_id:
+        for _, tc in get_all_active_characters(filter_chat_id=chat_id):
+            if active_char and tc.get("name") == active_char.get("name") and wants_self:
+                continue
+            if _name_in_text(tc.get("name"), req_low):
+                used_chars.append(("Персонаж из ролевой", tc))
+
     char_context = ""
-    if active_char:
-        char_context = (
-            f"\nДанные активного персонажа игрока (используй ИХ ТОЛЬКО если игрок просит нарисовать себя / своего персонажа / портрет):\n"
-            f"- Имя: {active_char.get('name', '—')}\n"
-            f"- Пол и возраст: {active_char.get('gender', '—')}, {active_char.get('age', '—')}\n"
-            f"- Титул/Сословие: {active_char.get('title', '—')} / {active_char.get('estate', '—')}\n"
-            f"- Внешность: {active_char.get('appearance', '—')}\n"
-        )
+    used_names = []
+    if used_chars:
+        char_context = "\n🚨 ОБЯЗАТЕЛЬНАЯ ВНЕШНОСТЬ ПЕРСОНАЖЕЙ (ПЕРЕВЕДИ И ВКЛЮЧИ КАЖДУЮ ДЕТАЛЬ В ПРОМПТ!):\n"
+        for role_label, ch in used_chars:
+            used_names.append(ch.get("name", "Персонаж"))
+            char_context += (
+                f"[{role_label}: {ch.get('name', '—')}]\n"
+                f"- Пол и возраст: {ch.get('gender', '—')}, {ch.get('age', '—')}\n"
+                f"- Титул / Сословие / Занятие: {ch.get('title', '—')} / {ch.get('estate', '—')} / {ch.get('occupation', '—')}\n"
+                f"- ТОЧНОЕ ОПИСАНИЕ ВНЕШНОСТИ (цвет волос, глаз, черты лица, телосложение, детали): {ch.get('appearance', '—')}\n\n"
+            )
 
     prompt = f"""
-Ты — профессиональный художник-иллюстратор и промпт-инженер для нейросети FLUX.1.
-Пользователь Telegram-бота (ролевая игра по Российской Империи 1838 года) попросил нарисовать:
+Ты — элитный арт-директор и мастер-промптер для нейросети FLUX.1 Schnell.
+Пользователь прислал короткую идею/промпт:
 "{user_request}"
 {char_context}
 
-ТВОЯ ЗАДАЧА — написать ОДИН идеальный, живописный промпт НА АНГЛИЙСКОМ ЯЗЫКЕ (от 25 до 45 слов).
+ТВОЯ ЗАДАЧА — полностью переработать и обогатить запрос пользователя, превратив его в ОДИН подробный, кинематографичный, визуально потрясающий промпт НА АНГЛИЙСКОМ ЯЗЫКЕ (от 60 до 105 слов).
 
-ПРАВИЛА ПРОМПТА:
-1. Описывай сцену визуально: кто или что в центре кадра, поза, выражение лица, одежда, детали интерьера/фона, освещение, текстуры.
-2. СТИЛЬ И КАЧЕСТВО:
-   - Если запрос связан с XIX веком, дворянством, балами, дуэлями, Петербургом или персонажем без указания иного стиля — задай стиль роскошной исторической живописи и кинематографического реализма 1838 года (19th century Russian Empire 1838 aesthetic, oil painting masterpiece mixed with cinematic realism, warm candlelight, intricate fabrics, gold embroidery, dramatic chiaroscuro lighting, sharp focus).
-   - Если запрос современный, фантастический или шуточный (например, аниме, киберпанк, кот в космосе) — строго сохрани задуманную тему и стиль, добавив высокую детализацию (highly detailed, cinematic lighting, vibrant colors, sharp focus, masterpiece).
-3. СТРОГИЕ ТЕХНИЧЕСКИЕ ОГРАНИЧЕНИЯ:
-   - Ответь ТОЛЬКО самим английским текстом! Никаких пояснений, кавычек, списков и русского текста.
-   - Не используй символы `/`, `?`, `#`, переносы строк (пиши в одну строку через запятые).
-   - Длина строго до 320 символов, чтобы промпт идеально прошёл по URL.
+СТРОГИЕ ПРАВИЛА ПЕРЕРАБОТКИ:
+1. ВНЕШНОСТЬ ИЗ АНКЕТЫ (КРИТИЧЕСКИ ВАЖНО!): Если выше передан блок «ОБЯЗАТЕЛЬНАЯ ВНЕШНОСТЬ ПЕРСОНАЖЕЙ» — ты ОБЯЗАНА дословно перевести на английский и вплести в сцену КАЖДУЮ физическую деталь: точный пол, возраст, цвет и длину волос, цвет глаз, черты лица, рост/фигуру, шрамы, особенности, а также подходящий эпохе и титулу костюм. НЕ заменяй описание из анкеты выдуманным!
+2. ХУДОЖЕСТВЕННОЕ ОБОГАЩЕНИЕ: Даже если пользователь написал 2–4 слова (например «кот на балу» или «девушка у окна»), детально проработай:
+   - Композицию и ракурс (portrait framing, medium wide shot, shallow depth of field, rule of thirds).
+   - Освещение и атмосферу (dramatic warm candlelight, golden sunbeams through frosted glass, soft rim light, glowing reflections, volumetric mist).
+   - Фактуры и микродетали (intricate silk embroidery, heavy velvet folds, lace trim, glistening snow, polished marble, expressive eyes, realistic skin texture).
+   - Фоновое окружение (украшения зала, колонны, убранство, пейзаж).
+3. СТИЛЬ:
+   - Если запрос касается ролевой, XIX века, балов, дворян, дуэлей, Петербурга или персонажей без иного указания стиля — задай эстетику роскошной живописи XIX века и высокобюджетного исторического кино 1838 года (1838 Imperial Russian Empire aesthetic, masterpiece oil painting fused with cinematic photorealism, rich chiaroscuro lighting, museum-grade detail, crisp focus).
+   - Если пользователь явно попросил другой стиль (аниме, киберпанк, мультяшный, неон, фэнтези) — выдержи именно его стиль на максимальном уровне качества (top-tier visual quality, vibrant palette, crisp linework/lighting, masterpiece).
+4. ТЕХНИЧЕСКИЕ ПРАВИЛА:
+   - Верни ТОЛЬКО готовый английский текст одной строкой! Никаких вступлений, кавычек, переносов строк и символов `/`, `?`, `#`.
+   - Длина от 350 до 850 символов.
 """
-    eng_prompt, err = await generate_gemini_text_safe(prompt, model_name=MODEL_LITE)
+    eng_prompt, err = await generate_gemini_text_safe(prompt, model_name=MODEL_SMART)
     if err or not eng_prompt:
-        eng_prompt, err = await generate_gemini_text_safe(prompt, model_name=MODEL_SMART)
+        eng_prompt, err = await generate_gemini_text_safe(prompt, model_name=MODEL_LITE)
 
     if not eng_prompt:
-        eng_prompt = f"{user_request}, masterpiece, highly detailed, cinematic lighting, rich textures, sharp focus"
+        fallback_parts = [user_request]
+        for _, ch in used_chars:
+            fallback_parts.append(f"{ch.get('gender', '')} {ch.get('age', '')} {ch.get('appearance', '')}")
+        eng_prompt = ", ".join(p for p in fallback_parts if p) + ", cinematic lighting, ultra detailed, rich textures, masterpiece"
 
     eng_prompt = re.sub(r'[\n\r"«»`/?#]+', ' ', eng_prompt)
     eng_prompt = re.sub(r'\s{2,}', ' ', eng_prompt).strip()
-    return eng_prompt[:330]
+    return eng_prompt[:850], used_names
 
-async def generate_katya_art(user_request, active_char=None):
-    """Генерирует промпт и запрашивает готовую картинку у вашего Cloudflare Worker."""
-    eng_prompt = await build_art_prompt_with_ai(user_request, active_char=active_char)
+async def generate_katya_art(user_request, active_char=None, chat_id=None):
+    """Генерирует обогащенный промпт и запрашивает готовую картинку у вашего Cloudflare Worker."""
+    eng_prompt, used_names = await build_art_prompt_with_ai(
+        user_request, active_char=active_char, chat_id=chat_id
+    )
     encoded_prompt = urllib.parse.quote(eng_prompt, safe="")
     request_url = f"{CLOUDFLARE_IMAGE_URL}{encoded_prompt}"
 
@@ -881,14 +944,14 @@ async def generate_katya_art(user_request, active_char=None):
             if resp.status_code == 200 and content_type.startswith("image/") and len(resp.content) > 500:
                 img_bytes = io.BytesIO(resp.content)
                 img_bytes.name = "katya_art.jpg"
-                return img_bytes, eng_prompt, None
+                return img_bytes, eng_prompt, used_names, None
 
             err_body = resp.text[:250] if resp.text else f"HTTP {resp.status_code}"
             print("Ошибка ответа Cloudflare Worker:", resp.status_code, content_type, err_body)
-            return None, eng_prompt, "Я уронила палитру — картину не удалось завершить (возможно, исчерпан дневной лимит холстов)."
+            return None, eng_prompt, used_names, "Я уронила палитру — картину не удалось завершить (возможно, исчерпан дневной лимит холстов)."
     except Exception as e:
         print("Ошибка соединения с Cloudflare Worker:", e)
-        return None, eng_prompt, "Художественная лавка сейчас не отвечает. Попробуйте повторить запрос чуть позже."
+        return None, eng_prompt, used_names, "Художественная лавка сейчас не отвечает. Попробуйте повторить запрос чуть позже."
 
 # ==========================
 # ГЕНЕРАТОР СВЕТСКИХ СОВЕТОВ ПО ОТЫГРЫШУ (/совет)
@@ -3991,7 +4054,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_long_html(update.message, final_message)
         return
 
-    # ==========================
+ # ==========================
     # КОМАНДА /арт / /нарисуй (ГЕНЕРАЦИЯ КАРТИНОК)
     # ==========================
     art_prefixes = [
@@ -4017,13 +4080,14 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        chars = get_characters(user_id)
-        active_char = ACTIVE_CHARACTER.get(user_id) or (chars[0] if chars else None)
+        active_char = get_real_active_character(user_id, sender_user_id)
         dear = get_dear(active_char)
 
-        working_msg = await update.message.reply_text(f"// *Берусь за кисти и мольберт...* Пишу картину для вас, {dear}! 🎨")
+        working_msg = await update.message.reply_text(f"// *Берусь за кисти и мольберт...* Продумываю детали и пишу картину для вас, {dear}! 🎨")
 
-        img_io, eng_prompt, err = await generate_katya_art(art_query, active_char=active_char)
+        img_io, eng_prompt, used_names, err = await generate_katya_art(
+            art_query, active_char=active_char, chat_id=chat_id
+        )
 
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=working_msg.message_id)
@@ -4034,9 +4098,11 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"// {err or 'Увы, краски подвели меня.'}")
             return
 
+        char_tag = f"\n👤 <b>Персонаж(и) из анкеты:</b> {html.escape(', '.join(used_names))}" if used_names else ""
         caption_text = (
             f"// *Изящным жестом откладывает кисть* Вот ваш холст, {dear}! 🎨\n"
-            f"<blockquote>🖌️ <i>Запрос: {html.escape(art_query[:180])}</i></blockquote>"
+            f"<blockquote expandable>🖌️ <b>Запрос:</b> <i>{html.escape(art_query[:150])}</i>{char_tag}\n"
+            f"✨ <b>Промпт для нейросети:</b> <i>{html.escape(eng_prompt[:600])}</i></blockquote>"
         )
         try:
             await update.message.reply_photo(photo=img_io, caption=caption_text, parse_mode="HTML")
