@@ -32,6 +32,7 @@ from telegram.ext import (
 )
 
 from google import genai
+from google.genai import types
 
 from config import (
     TELEGRAM_TOKEN,
@@ -669,6 +670,11 @@ def get_directive_for_user(user_id, active_char=None, username=None):
 # Вспомогательная асинхронная обертка для Gemini (с поддержкой моделей и errors.py)
 # ==========================
 
+def create_client():
+    return genai.Client(
+        api_key=next(keys)
+    )
+
 async def call_gemini_async(messages, model_name=MODEL_SMART):
     """Выполняет тяжелый запрос к Gemini в отдельном потоке."""
     def _sync_call():
@@ -696,6 +702,98 @@ async def generate_gemini_text_safe(messages, model_name=MODEL_SMART):
             return "", err_msg
 
     return "", last_err_msg
+
+# ==========================
+# ПОИСК В ИНТЕРНЕТЕ С ИСТОЧНИКАМИ (GROUNDING WITH GOOGLE SEARCH)
+# ==========================
+
+def extract_search_sources(response, forbidden_sources=None):
+    """Извлекает реальные кликабельные ссылки и названия источников из метаданных поиска Gemini."""
+    sources = []
+    if not response or not hasattr(response, "candidates") or not response.candidates:
+        return sources
+
+    forbidden_lower = [f.lower().strip() for f in (forbidden_sources or []) if f.strip()]
+
+    try:
+        cand = response.candidates[0]
+        meta = getattr(cand, "grounding_metadata", None)
+        if meta and hasattr(meta, "grounding_chunks") and meta.grounding_chunks:
+            seen_urls = set()
+            for chunk in meta.grounding_chunks:
+                web = getattr(chunk, "web", None)
+                if web:
+                    uri = getattr(web, "uri", None)
+                    title = getattr(web, "title", "Источник") or "Источник"
+                    if uri and uri not in seen_urls:
+                        is_forbidden = any(
+                            fb in uri.lower() or fb in title.lower() for fb in forbidden_lower
+                        )
+                        if not is_forbidden:
+                            seen_urls.add(uri)
+                            sources.append((title, uri))
+    except Exception as e:
+        print("Ошибка извлечения источников поиска:", e)
+
+    return sources
+
+async def ask_gemini_with_web_search(query_text, user_id=None):
+    """Выполняет веб-поиск через Gemini Grounding с учётом запретов на источники на естественном языке."""
+    prompt = f"""
+Ты — императрица Екатерина II, царственная, мудрая и ироничная правительница.
+Однако сейчас тебя попросили узнать свежие и достоверные сведения из современного мира (интернета).
+
+Запрос пользователя: "{query_text}"
+
+СТРОГИЕ ПРАВИЛА ПОИСКА И ОТВЕТА:
+1. Найди в интернете свежую, точную и объективную информацию по запросу пользователя.
+2. ВНИМАНИЕ К ИСКЛЮЧЕНИЯМ И ЗАПРЕТАМ: Если пользователь просит НЕ учитывать, НЕ использовать, НЕ брать информацию или исключить определенный сайт/источник (например: «не учитывай википедию», «без dzen.ru», «не бери с reddit», «кроме ria.ru»):
+   - Ты ОБЯЗАНА категорически проигнорировать этот сайт и не использовать данные оттуда!
+3. Дай развёрнутый, структурированный и понятный ответ. Можешь сохранить легкий императорский колорит и изящество манер Екатерины II.
+4. НЕ пиши ссылки вручную внутри текста ответа — бот сам сформирует аккуратный список проверенных источников в конце сообщения.
+"""
+    attempts = len(GEMINI_KEYS) if GEMINI_KEYS else 1
+    last_err = UNKNOWN_ERROR
+
+    for attempt in range(attempts):
+        try:
+            def _sync_search():
+                client = create_client()
+                config = types.GenerateContentConfig(
+                    tools=[types.Tool(google_search=types.GoogleSearch())],
+                    temperature=0.3
+                )
+                return client.models.generate_content(
+                    model=MODEL_SMART,
+                    contents=prompt,
+                    config=config
+                )
+
+            response = await asyncio.to_thread(_sync_search)
+            text_result = get_gemini_text(response)
+
+            # Извлекаем названия исключаемых сайтов для жесткой фильтрации блока ссылок
+            forbidden = []
+            m_excl = re.findall(
+                r'(?:не\s+(?:учитывай|бери|используй)|без|кроме|исключи|проигнорируй)\s+([a-zA-Zа-яА-Я0-9_.\-]+)',
+                query_text.lower()
+            )
+            if m_excl:
+                forbidden.extend(m_excl)
+                if any("вики" in f for f in m_excl):
+                    forbidden.extend(["wikipedia.org", "wikipedia", "википедия"])
+
+            sources = extract_search_sources(response, forbidden_sources=forbidden)
+            return text_result, sources, None
+        except Exception as e:
+            print(f"Ошибка поиска Gemini (попытка {attempt+1}/{attempts}):", e)
+            err_type, err_msg = classify_gemini_error(e)
+            last_err = err_msg
+            if err_type == "quota" or (err_type == "no_key" and attempt + 1 < attempts):
+                continue
+            return "", [], last_err
+
+    return "", [], last_err
 
 # ==========================
 # ГЕНЕРАТОР СВЕТСКИХ СОВЕТОВ ПО ОТЫГРЫШУ (/совет)
@@ -1556,6 +1654,7 @@ async def post_init(application: Application) -> None:
     try:
         await application.bot.set_my_commands([
             BotCommand("help", "Свод всех команд и правил"),
+            BotCommand("search", "Поиск в интернете со ссылками"),
             BotCommand("anketa", "Моя анкета и отношение Кати"),
             BotCommand("my_chars", "Выбор персонажа, ДР и отношения"),
             BotCommand("new_anketa", "Создать новую анкету"),
@@ -2069,15 +2168,6 @@ def apply_duel_result(target_user_id, result_type, opponent_name, duration, end_
     ACTIVE_CHARACTER[target_user_id] = active_char
     return unlocked
 
-# ==========================
-# Gemini
-# ==========================
-
-def create_client():
-    return genai.Client(
-        api_key=next(keys)
-    )
-
 MEMORY_LIMIT = 50
 WAITING_CHARACTER = {}
 ACTIVE_CHARACTER = {}
@@ -2243,7 +2333,6 @@ async def ask_katya_image(images, text, user_id, username=None):
     if not answer.startswith("//"):
         answer = "// " + answer
 
-    # Мягкое влияние оценки наряда на отношения (без резких скачков)
     if active_character:
         ans_low = answer.lower()
         if "да, можно." in ans_low:
@@ -3695,6 +3784,8 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         help_text = (
             "<b>📜 ИМПЕРАТОРСКИЙ СВОД ПРАВИЛ И КОМАНД (1838 ГОД)</b>\n"
             "ㅤㅤ∴ ════ ∴ ✦ ∴ ════ ∴\n\n"
+            "<b>🌐 Поиск и Внешний мир:</b>\n"
+            "• <code>/поиск [запрос]</code> (<code>/search</code>) — поиск актуальных сведений в интернете с прямыми ссылками. <i>Можно попросить: «не учитывай википедию» или «без dzen.ru»</i>.\n\n"
             "<b>👤 Персонажи, Анкеты и Отношения:</b>\n"
             "• <code>/новая_анкета</code> (<code>/new_anketa</code>, <code>катя новая анкета</code>) — подать анкету ко двору.\n"
             "• <code>/мои_персонажи</code> (<code>/my_chars</code>) — переключение героев, личная дата рождения и отношение Кати ко всем персонажам.\n"
@@ -3748,6 +3839,56 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         await update.message.reply_text(f"<blockquote expandable>{help_text}</blockquote>", parse_mode="HTML")
+        return
+
+    # ==========================
+    # КОМАНДА /поиск (/search)
+    # ==========================
+    if lower.startswith("/поиск") or lower.startswith("/search") or lower.startswith("катя найди") or lower.startswith("катя, найди"):
+        search_query = ""
+        for pfx in ["/поиск", "/search", "катя, найди", "катя найди"]:
+            if lower.startswith(pfx):
+                search_query = text[len(pfx):].strip(" ,:")
+                break
+
+        if not search_query:
+            await update.message.reply_text(
+                "// Укажите, что именно вы желаете сыскать на просторах паутины, милая!\n\n"
+                "<i>Примеры:\n"
+                "• <code>/поиск последние открытия телескопа Джеймс Уэбб</code>\n"
+                "• <code>/поиск биография Пушкина, не учитывай википедию</code>\n"
+                "• <code>/поиск курс серебра, без сайта banki.ru</code></i>",
+                parse_mode="HTML"
+            )
+            return
+
+        working_msg = await update.message.reply_text("// Отправляю тайных вестовых за свежими вестями... 🌐")
+
+        answer_text, sources, err = await ask_gemini_with_web_search(search_query, user_id=user_id)
+
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=working_msg.message_id)
+        except Exception:
+            pass
+
+        if err:
+            await update.message.reply_text(f"// {err}")
+            return
+
+        if not answer_text:
+            await update.message.reply_text("// Вестовые вернулись ни с чем — сведений сыскать не удалось.")
+            return
+
+        sources_block = ""
+        if sources:
+            sources_lines = []
+            for idx, (title, uri) in enumerate(sources[:6], 1):
+                clean_title = html.escape(title[:60])
+                sources_lines.append(f"{idx}. <a href=\"{html.escape(uri)}\">{clean_title}</a>")
+            sources_block = "\n\n🔗 <b>Изученные источники:</b>\n" + "\n".join(sources_lines)
+
+        final_message = f"<b>🌐 Результаты столичного поиска:</b>\n<blockquote expandable>{answer_text}{sources_block}</blockquote>"
+        await send_long_html(update.message, final_message)
         return
 
     # ==========================
@@ -4510,6 +4651,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/совет", "/advice", "/добавить_анкету", "/удалить_анкету",
         "/добавить_админа", "/удалить_админа", "/админы",
         "/репорт", "/report", "/дуэль_исход", "/дуэль_сброс",
+        "/поиск", "/search",
         "/мои_персонажи", "/персонажи", "/my_chars", "/помощь", "/help"
     ]
     
