@@ -11,6 +11,8 @@ import asyncio
 import threading
 import logging
 import html
+import urllib.parse
+import httpx
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from PIL import Image
 
@@ -709,7 +711,7 @@ async def generate_gemini_text_safe(messages, model_name=MODEL_SMART):
 # ==========================
 
 async def ask_gemini_with_web_search(query_text, user_id=None):
-    """Выполняет 100% бесплатный поиск через DuckDuckGo, обходя любые лимиты Google квот."""
+    """Выполняет 100% бесплатный поиск через DuckDuckGo, отбирает только релевантные ссылки и отвечает от лица «Я»."""
     clean_query = query_text
 
     # Выявляем сайты, которые пользователь просит исключить
@@ -729,21 +731,26 @@ async def ask_gemini_with_web_search(query_text, user_id=None):
         '',
         clean_query,
         flags=re.IGNORECASE
-    ).strip()
+    ).strip(" ,.-")
 
     if not clean_query:
         clean_query = query_text
+
+    # Русские запросы ищем в ru-ru, чтобы не лезли случайные зарубежные форумы и Reddit
+    ddg_region = "ru-ru" if re.search(r'[а-яА-ЯёЁ]', clean_query) else "wt-wt"
 
     def _search_web():
         results = []
         try:
             with DDGS() as ddgs:
-                raw_results = list(ddgs.text(clean_query, max_results=6))
+                raw_results = list(ddgs.text(clean_query, region=ddg_region, safesearch="moderate", max_results=8))
                 for r in raw_results:
                     url = r.get("href", "")
                     title = r.get("title", "Источник")
                     body = r.get("body", "")
 
+                    if not url or not body:
+                        continue
                     if forbidden and any(fb in url.lower() or fb in title.lower() for fb in forbidden):
                         continue
 
@@ -755,31 +762,133 @@ async def ask_gemini_with_web_search(query_text, user_id=None):
     found_sources = await asyncio.to_thread(_search_web)
 
     if not found_sources:
-        return "", [], "Вестовые вернулись ни с чем — сведений сыскать не удалось или все они попали под исключения."
+        return "", [], "Мне не удалось ничего найти по этому запросу, либо все подходящие сайты попали под ваше ограничение."
 
     context_text = ""
-    sources_list = []
-    for s in found_sources:
-        context_text += f"\nИсточник [{s['title']}]: {s['snippet']}\n"
-        sources_list.append((s['title'], s['url']))
+    for idx, s in enumerate(found_sources, 1):
+        context_text += f"\n[{idx}] Заголовок: {s['title']}\nURL: {s['url']}\nФрагмент: {s['snippet']}\n"
 
     prompt = f"""
-Ты — императрица Екатерина II, царственная, мудрая и благосклонная правительница.
+Ты — императрица Екатерина II.
 Пользователь задал вопрос: "{query_text}"
 
-Вот свежие данные, найденные вестовыми в источниках:
+Вот материалы, которые ты сама только что просмотрела в интернете:
 {context_text}
 
-ТВОЯ ЗАДАЧА:
-1. Опираясь на предоставленные данные, дай точный, развернутый и объективный ответ.
-2. Сохрани лёгкий, изысканный и благосклонный стиль Екатерины II.
-3. Не придумывай ссылки в тексте ответа — система сама прикрепит проверенные адреса в конце.
+СТРОГИЕ ПРАВИЛА ОТВЕТА:
+1. ТОЛЬКО ЕДИНСТВЕННОЕ ЧИСЛО: Говори строго от первого лица единственного числа («я», «я нашла», «я выяснила», «мне удалось узнать», «я прочла»). КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО говорить о себе во множественном числе («мы», «нам», «наши», «наши люди») или упоминать каких-либо «вестовых»!
+2. ТОЧНОСТЬ И ТОН: Опираясь на найденные материалы, дай точный, развёрнутый и понятный ответ в лёгком и благосклонном стиле Екатерины II.
+3. ОТБОР ТОЛЬКО ПОЛЕЗНЫХ ССЫЛОК: Среди пронумерованных материалов [1..{len(found_sources)}] выбери ТОЛЬКО те номера, которые реально отвечают на вопрос и относятся к делу. Категорически НЕ выбирай случайные треды с Reddit, мусорные форумы или страницы не по теме!
+4. НЕ пиши ссылки в самом тексте. В самом конце ответа с новой строки напиши СТРОГО в таком формате номера использованных тобой полезных источников:
+USED_SOURCES: 1, 2
+(Если ни один из источников не подошёл по сути, напиши: USED_SOURCES: none)
 """
     answer_text, err = await generate_gemini_text_safe(prompt, model_name=MODEL_SMART)
     if err:
         answer_text, err = await generate_gemini_text_safe(prompt, model_name=MODEL_LITE)
 
-    return answer_text, sources_list, err
+    if err or not answer_text:
+        return answer_text, [], err
+
+    # Извлекаем только те источники, которые реально пригодились
+    selected_indices = []
+    m_used = re.search(r'(?im)^\s*USED_SOURCES\s*:\s*([^\n]+)\s*$', answer_text)
+    if m_used:
+        raw_used = m_used.group(1).strip().lower()
+        answer_text = re.sub(r'(?im)\n?\s*USED_SOURCES\s*:[^\n]*', '', answer_text).strip()
+        if "none" not in raw_used:
+            for num_str in re.findall(r'\d+', raw_used):
+                num_i = int(num_str)
+                if 1 <= num_i <= len(found_sources) and num_i not in selected_indices:
+                    selected_indices.append(num_i)
+
+    # Приводим форматирование к безопасному для Telegram HTML
+    answer_text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', answer_text)
+    answer_text = re.sub(r'</?h[1-6]\s*[^>]*>', '', answer_text)
+    answer_text = re.sub(r'</?p\s*[^>]*>', '\n\n', answer_text)
+    answer_text = re.sub(r'<br\s*/?>', '\n', answer_text)
+
+    sources_list = []
+    if selected_indices:
+        for idx in selected_indices:
+            s = found_sources[idx - 1]
+            sources_list.append((s['title'], s['url']))
+    elif not m_used:
+        for s in found_sources:
+            if "reddit.com" not in s['url'].lower() and len(sources_list) < 3:
+                sources_list.append((s['title'], s['url']))
+
+    return answer_text, sources_list, None
+
+# ==========================
+# ХУДОЖЕСТВЕННАЯ МАСТЕРСКАЯ КАТИ (CLOUDFLARE FLUX + GEMINI ПРОМПТ)
+# ==========================
+
+CLOUDFLARE_IMAGE_URL = "https://dark-fire-6107.inetlesya.workers.dev/prompt/"
+
+async def build_art_prompt_with_ai(user_request, active_char=None):
+    """Превращает короткий запрос игрока в шикарный, детальный промпт для FLUX на английском."""
+    char_context = ""
+    if active_char:
+        char_context = (
+            f"\nДанные активного персонажа игрока (используй ИХ ТОЛЬКО если игрок просит нарисовать себя / своего персонажа / портрет):\n"
+            f"- Имя: {active_char.get('name', '—')}\n"
+            f"- Пол и возраст: {active_char.get('gender', '—')}, {active_char.get('age', '—')}\n"
+            f"- Титул/Сословие: {active_char.get('title', '—')} / {active_char.get('estate', '—')}\n"
+            f"- Внешность: {active_char.get('appearance', '—')}\n"
+        )
+
+    prompt = f"""
+Ты — профессиональный художник-иллюстратор и промпт-инженер для нейросети FLUX.1.
+Пользователь Telegram-бота (ролевая игра по Российской Империи 1838 года) попросил нарисовать:
+"{user_request}"
+{char_context}
+
+ТВОЯ ЗАДАЧА — написать ОДИН идеальный, живописный промпт НА АНГЛИЙСКОМ ЯЗЫКЕ (от 25 до 45 слов).
+
+ПРАВИЛА ПРОМПТА:
+1. Описывай сцену визуально: кто или что в центре кадра, поза, выражение лица, одежда, детали интерьера/фона, освещение, текстуры.
+2. СТИЛЬ И КАЧЕСТВО:
+   - Если запрос связан с XIX веком, дворянством, балами, дуэлями, Петербургом или персонажем без указания иного стиля — задай стиль роскошной исторической живописи и кинематографического реализма 1838 года (19th century Russian Empire 1838 aesthetic, oil painting masterpiece mixed with cinematic realism, warm candlelight, intricate fabrics, gold embroidery, dramatic chiaroscuro lighting, sharp focus).
+   - Если запрос современный, фантастический или шуточный (например, аниме, киберпанк, кот в космосе) — строго сохрани задуманную тему и стиль, добавив высокую детализацию (highly detailed, cinematic lighting, vibrant colors, sharp focus, masterpiece).
+3. СТРОГИЕ ТЕХНИЧЕСКИЕ ОГРАНИЧЕНИЯ:
+   - Ответь ТОЛЬКО самим английским текстом! Никаких пояснений, кавычек, списков и русского текста.
+   - Не используй символы `/`, `?`, `#`, переносы строк (пиши в одну строку через запятые).
+   - Длина строго до 320 символов, чтобы промпт идеально прошёл по URL.
+"""
+    eng_prompt, err = await generate_gemini_text_safe(prompt, model_name=MODEL_LITE)
+    if err or not eng_prompt:
+        eng_prompt, err = await generate_gemini_text_safe(prompt, model_name=MODEL_SMART)
+
+    if not eng_prompt:
+        eng_prompt = f"{user_request}, masterpiece, highly detailed, cinematic lighting, rich textures, sharp focus"
+
+    eng_prompt = re.sub(r'[\n\r"«»`/?#]+', ' ', eng_prompt)
+    eng_prompt = re.sub(r'\s{2,}', ' ', eng_prompt).strip()
+    return eng_prompt[:330]
+
+async def generate_katya_art(user_request, active_char=None):
+    """Генерирует промпт и запрашивает готовую картинку у вашего Cloudflare Worker."""
+    eng_prompt = await build_art_prompt_with_ai(user_request, active_char=active_char)
+    encoded_prompt = urllib.parse.quote(eng_prompt, safe="")
+    request_url = f"{CLOUDFLARE_IMAGE_URL}{encoded_prompt}"
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            resp = await client.get(request_url)
+            content_type = resp.headers.get("content-type", "").lower()
+
+            if resp.status_code == 200 and content_type.startswith("image/") and len(resp.content) > 500:
+                img_bytes = io.BytesIO(resp.content)
+                img_bytes.name = "katya_art.jpg"
+                return img_bytes, eng_prompt, None
+
+            err_body = resp.text[:250] if resp.text else f"HTTP {resp.status_code}"
+            print("Ошибка ответа Cloudflare Worker:", resp.status_code, content_type, err_body)
+            return None, eng_prompt, "Я уронила палитру — картину не удалось завершить (возможно, исчерпан дневной лимит холстов)."
+    except Exception as e:
+        print("Ошибка соединения с Cloudflare Worker:", e)
+        return None, eng_prompt, "Художественная лавка сейчас не отвечает. Попробуйте повторить запрос чуть позже."
 
 # ==========================
 # ГЕНЕРАТОР СВЕТСКИХ СОВЕТОВ ПО ОТЫГРЫШУ (/совет)
@@ -1641,6 +1750,7 @@ async def post_init(application: Application) -> None:
         await application.bot.set_my_commands([
             BotCommand("help", "Свод всех команд и правил"),
             BotCommand("search", "Поиск в интернете со ссылками"),
+            BotCommand("art", "Нарисовать картину / портрет (ИИ)"),
             BotCommand("anketa", "Моя анкета и отношение Кати"),
             BotCommand("my_chars", "Выбор персонажа, ДР и отношения"),
             BotCommand("new_anketa", "Создать новую анкету"),
@@ -2153,7 +2263,6 @@ def apply_duel_result(target_user_id, result_type, opponent_name, duration, end_
     save_characters(target_user_id, chars)
     ACTIVE_CHARACTER[target_user_id] = active_char
     return unlocked
-
 MEMORY_LIMIT = 50
 WAITING_CHARACTER = {}
 ACTIVE_CHARACTER = {}
@@ -3770,8 +3879,9 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         help_text = (
             "<b>📜 ИМПЕРАТОРСКИЙ СВОД ПРАВИЛ И КОМАНД (1838 ГОД)</b>\n"
             "ㅤㅤ∴ ════ ∴ ✦ ∴ ════ ∴\n\n"
-            "<b>🌐 Поиск и Внешний мир:</b>\n"
-            "• <code>/поиск [запрос]</code> (<code>/search</code>) — поиск актуальных сведений в интернете с прямыми ссылками. <i>Можно попросить: «не учитывай википедию» или «без dzen.ru»</i>.\n\n"
+            "<b>🌐 Поиск и Картины:</b>\n"
+            "• <code>/поиск [запрос]</code> (<code>/search</code>) — поиск актуальных сведений в интернете с прямыми ссылками. <i>Можно попросить: «не учитывай википедию» или «без dzen.ru»</i>.\n"
+            "• <code>/арт [описание]</code> (<code>/нарисуй</code>, <code>/art</code>) — написать картину или портрет вашего персонажа.\n\n"
             "<b>👤 Персонажи, Анкеты и Отношения:</b>\n"
             "• <code>/новая_анкета</code> (<code>/new_anketa</code>, <code>катя новая анкета</code>) — подать анкету ко двору.\n"
             "• <code>/мои_персонажи</code> (<code>/my_chars</code>) — переключение героев, личная дата рождения и отношение Кати ко всем персонажам.\n"
@@ -3837,18 +3947,22 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 search_query = text[len(pfx):].strip(" ,:")
                 break
 
+        chars = get_characters(user_id)
+        active_char = ACTIVE_CHARACTER.get(user_id) or (chars[0] if chars else None)
+        mily = get_mily(active_char)
+
         if not search_query:
             await update.message.reply_text(
-                "// Укажите, что именно вы желаете сыскать на просторах паутины, милая!\n\n"
+                f"// Укажите, что именно вы желаете узнать, {mily}!\n\n"
                 "<i>Примеры:\n"
-                "• <code>/поиск последние открытия телескопа Джеймс Уэбб</code>\n"
+                "• <code>/поиск когда умер Александр Сергеевич Пушкин</code>\n"
                 "• <code>/поиск биография Пушкина, не учитывай википедию</code>\n"
                 "• <code>/поиск курс серебра, без сайта banki.ru</code></i>",
                 parse_mode="HTML"
             )
             return
 
-        working_msg = await update.message.reply_text("// Отправляю тайных вестовых за свежими вестями... 🌐")
+        working_msg = await update.message.reply_text(f"// Минутку, {mily}, я сейчас сама всё поищу и проверю... 🌐")
 
         answer_text, sources, err = await ask_gemini_with_web_search(search_query, user_id=user_id)
 
@@ -3862,19 +3976,73 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if not answer_text:
-            await update.message.reply_text("// Вестовые вернулись ни с чем — сведений сыскать не удалось.")
+            await update.message.reply_text(f"// Простите, {mily}, я ничего не смогла найти по вашему запросу.")
             return
 
         sources_block = ""
         if sources:
             sources_lines = []
-            for idx, (title, uri) in enumerate(sources[:6], 1):
-                clean_title = html.escape(title[:60])
+            for idx, (title, uri) in enumerate(sources[:5], 1):
+                clean_title = html.escape(title[:65])
                 sources_lines.append(f"{idx}. <a href=\"{html.escape(uri)}\">{clean_title}</a>")
             sources_block = "\n\n🔗 <b>Изученные источники:</b>\n" + "\n".join(sources_lines)
 
-        final_message = f"<b>🌐 Результаты столичного поиска:</b>\n<blockquote expandable>{answer_text}{sources_block}</blockquote>"
+        final_message = f"<b>🌐 Результаты поиска:</b>\n<blockquote expandable>{answer_text}{sources_block}</blockquote>"
         await send_long_html(update.message, final_message)
+        return
+
+    # ==========================
+    # КОМАНДА /арт / /нарисуй (ГЕНЕРАЦИЯ КАРТИНОК)
+    # ==========================
+    art_prefixes = [
+        "/арт", "/art", "/нарисуй", "/draw",
+        "катя, нарисуй", "катя нарисуй",
+        "катя, арт", "катя арт"
+    ]
+    if any(lower.startswith(pfx) for pfx in art_prefixes):
+        art_query = ""
+        for pfx in art_prefixes:
+            if lower.startswith(pfx):
+                art_query = text[len(pfx):].strip(" ,:")
+                break
+
+        if not art_query:
+            await update.message.reply_text(
+                "// Что именно вы желаете увидеть на холсте, милая?\n\n"
+                "<i>Примеры:\n"
+                "• <code>/арт бал в Зимнем дворце при свечах</code>\n"
+                "• <code>/нарисуй портрет моего персонажа в бальном платье</code>\n"
+                "• <code>/арт дуэль на Черной речке в утреннем тумане</code></i>",
+                parse_mode="HTML"
+            )
+            return
+
+        chars = get_characters(user_id)
+        active_char = ACTIVE_CHARACTER.get(user_id) or (chars[0] if chars else None)
+        dear = get_dear(active_char)
+
+        working_msg = await update.message.reply_text(f"// *Берусь за кисти и мольберт...* Пишу картину для вас, {dear}! 🎨")
+
+        img_io, eng_prompt, err = await generate_katya_art(art_query, active_char=active_char)
+
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=working_msg.message_id)
+        except Exception:
+            pass
+
+        if err or not img_io:
+            await update.message.reply_text(f"// {err or 'Увы, краски подвели меня.'}")
+            return
+
+        caption_text = (
+            f"// *Изящным жестом откладывает кисть* Вот ваш холст, {dear}! 🎨\n"
+            f"<blockquote>🖌️ <i>Запрос: {html.escape(art_query[:180])}</i></blockquote>"
+        )
+        try:
+            await update.message.reply_photo(photo=img_io, caption=caption_text, parse_mode="HTML")
+        except Exception as e:
+            print("Ошибка отправки сгенерированного фото в Telegram:", e)
+            await update.message.reply_text("// Картина написана, но передать её в чат не удалось.")
         return
 
     # ==========================
@@ -4637,7 +4805,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/совет", "/advice", "/добавить_анкету", "/удалить_анкету",
         "/добавить_админа", "/удалить_админа", "/админы",
         "/репорт", "/report", "/дуэль_исход", "/дуэль_сброс",
-        "/поиск", "/search",
+        "/поиск", "/search", "/арт", "/art", "/нарисуй", "/draw",
         "/мои_персонажи", "/персонажи", "/my_chars", "/помощь", "/help"
     ]
     
@@ -5798,4 +5966,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
