@@ -33,6 +33,7 @@ from telegram.ext import (
 
 from google import genai
 from google.genai import types
+from duckduckgo_search import DDGS
 
 from config import (
     TELEGRAM_TOKEN,
@@ -704,96 +705,81 @@ async def generate_gemini_text_safe(messages, model_name=MODEL_SMART):
     return "", last_err_msg
 
 # ==========================
-# ПОИСК В ИНТЕРНЕТЕ С ИСТОЧНИКАМИ (GROUNDING WITH GOOGLE SEARCH)
+# ПОИСК В ИНТЕРНЕТЕ С ИСТОЧНИКАМИ (БЕСПЛАТНЫЙ DUCKDUCKGO SEARCH)
 # ==========================
 
-def extract_search_sources(response, forbidden_sources=None):
-    """Извлекает реальные кликабельные ссылки и названия источников из метаданных поиска Gemini."""
-    sources = []
-    if not response or not hasattr(response, "candidates") or not response.candidates:
-        return sources
-
-    forbidden_lower = [f.lower().strip() for f in (forbidden_sources or []) if f.strip()]
-
-    try:
-        cand = response.candidates[0]
-        meta = getattr(cand, "grounding_metadata", None)
-        if meta and hasattr(meta, "grounding_chunks") and meta.grounding_chunks:
-            seen_urls = set()
-            for chunk in meta.grounding_chunks:
-                web = getattr(chunk, "web", None)
-                if web:
-                    uri = getattr(web, "uri", None)
-                    title = getattr(web, "title", "Источник") or "Источник"
-                    if uri and uri not in seen_urls:
-                        is_forbidden = any(
-                            fb in uri.lower() or fb in title.lower() for fb in forbidden_lower
-                        )
-                        if not is_forbidden:
-                            seen_urls.add(uri)
-                            sources.append((title, uri))
-    except Exception as e:
-        print("Ошибка извлечения источников поиска:", e)
-
-    return sources
-
 async def ask_gemini_with_web_search(query_text, user_id=None):
-    """Выполняет веб-поиск через Gemini Grounding с учётом запретов на источники на естественном языке."""
-    prompt = f"""
-Ты — императрица Екатерина II, царственная, мудрая и ироничная правительница.
-Однако сейчас тебя попросили узнать свежие и достоверные сведения из современного мира (интернета).
+    """Выполняет 100% бесплатный поиск через DuckDuckGo, обходя любые лимиты Google квот."""
+    clean_query = query_text
 
-Запрос пользователя: "{query_text}"
+    # Выявляем сайты, которые пользователь просит исключить
+    forbidden = []
+    m_excl = re.findall(
+        r'(?:не\s+(?:учитывай|бери|используй)|без|кроме|исключи|проигнорируй)\s+([a-zA-Zа-яА-Я0-9_.\-]+)',
+        query_text.lower()
+    )
+    if m_excl:
+        forbidden.extend(m_excl)
+        if any("вики" in f for f in m_excl):
+            forbidden.extend(["wikipedia.org", "wikipedia", "википедия"])
 
-СТРОГИЕ ПРАВИЛА ПОИСКА И ОТВЕТА:
-1. Найди в интернете свежую, точную и объективную информацию по запросу пользователя.
-2. ВНИМАНИЕ К ИСКЛЮЧЕНИЯМ И ЗАПРЕТАМ: Если пользователь просит НЕ учитывать, НЕ использовать, НЕ брать информацию или исключить определенный сайт/источник (например: «не учитывай википедию», «без dzen.ru», «не бери с reddit», «кроме ria.ru»):
-   - Ты ОБЯЗАНА категорически проигнорировать этот сайт и не использовать данные оттуда!
-3. Дай развёрнутый, структурированный и понятный ответ. Можешь сохранить легкий императорский колорит и изящество манер Екатерины II.
-4. НЕ пиши ссылки вручную внутри текста ответа — бот сам сформирует аккуратный список проверенных источников в конце сообщения.
-"""
-    attempts = len(GEMINI_KEYS) if GEMINI_KEYS else 1
-    last_err = UNKNOWN_ERROR
+    # Очищаем запрос для поисковика от служебных команд исключения
+    clean_query = re.sub(
+        r'(?:не\s+(?:учитывай|бери|используй)|без|кроме|исключи|проигнорируй)\s+[a-zA-Zа-яА-Я0-9_.\-]+',
+        '',
+        clean_query,
+        flags=re.IGNORECASE
+    ).strip()
 
-    for attempt in range(attempts):
+    if not clean_query:
+        clean_query = query_text
+
+    def _search_web():
+        results = []
         try:
-            def _sync_search():
-                client = create_client()
-                config = types.GenerateContentConfig(
-                    tools=[types.Tool(google_search=types.GoogleSearch())],
-                    temperature=0.3
-                )
-                return client.models.generate_content(
-                    model=MODEL_SMART,
-                    contents=prompt,
-                    config=config
-                )
+            with DDGS() as ddgs:
+                raw_results = list(ddgs.text(clean_query, max_results=6))
+                for r in raw_results:
+                    url = r.get("href", "")
+                    title = r.get("title", "Источник")
+                    body = r.get("body", "")
 
-            response = await asyncio.to_thread(_sync_search)
-            text_result = get_gemini_text(response)
+                    if forbidden and any(fb in url.lower() or fb in title.lower() for fb in forbidden):
+                        continue
 
-            # Извлекаем названия исключаемых сайтов для жесткой фильтрации блока ссылок
-            forbidden = []
-            m_excl = re.findall(
-                r'(?:не\s+(?:учитывай|бери|используй)|без|кроме|исключи|проигнорируй)\s+([a-zA-Zа-яА-Я0-9_.\-]+)',
-                query_text.lower()
-            )
-            if m_excl:
-                forbidden.extend(m_excl)
-                if any("вики" in f for f in m_excl):
-                    forbidden.extend(["wikipedia.org", "wikipedia", "википедия"])
-
-            sources = extract_search_sources(response, forbidden_sources=forbidden)
-            return text_result, sources, None
+                    results.append({"title": title, "url": url, "snippet": body})
         except Exception as e:
-            print(f"Ошибка поиска Gemini (попытка {attempt+1}/{attempts}):", e)
-            err_type, err_msg = classify_gemini_error(e)
-            last_err = err_msg
-            if err_type == "quota" or (err_type == "no_key" and attempt + 1 < attempts):
-                continue
-            return "", [], last_err
+            print("Ошибка поиска в DuckDuckGo:", e)
+        return results
 
-    return "", [], last_err
+    found_sources = await asyncio.to_thread(_search_web)
+
+    if not found_sources:
+        return "", [], "Вестовые вернулись ни с чем — сведений сыскать не удалось или все они попали под исключения."
+
+    context_text = ""
+    sources_list = []
+    for s in found_sources:
+        context_text += f"\nИсточник [{s['title']}]: {s['snippet']}\n"
+        sources_list.append((s['title'], s['url']))
+
+    prompt = f"""
+Ты — императрица Екатерина II, царственная, мудрая и благосклонная правительница.
+Пользователь задал вопрос: "{query_text}"
+
+Вот свежие данные, найденные вестовыми в источниках:
+{context_text}
+
+ТВОЯ ЗАДАЧА:
+1. Опираясь на предоставленные данные, дай точный, развернутый и объективный ответ.
+2. Сохрани лёгкий, изысканный и благосклонный стиль Екатерины II.
+3. Не придумывай ссылки в тексте ответа — система сама прикрепит проверенные адреса в конце.
+"""
+    answer_text, err = await generate_gemini_text_safe(prompt, model_name=MODEL_SMART)
+    if err:
+        answer_text, err = await generate_gemini_text_safe(prompt, model_name=MODEL_LITE)
+
+    return answer_text, sources_list, err
 
 # ==========================
 # ГЕНЕРАТОР СВЕТСКИХ СОВЕТОВ ПО ОТЫГРЫШУ (/совет)
