@@ -2,6 +2,7 @@ import itertools
 import re
 import io
 import json
+import base64
 import random
 import time
 import datetime
@@ -821,13 +822,142 @@ USED_SOURCES: 1, 2
     return answer_text, sources_list, None
 
 # ==========================
-# ХУДОЖЕСТВЕННАЯ МАСТЕРСКАЯ КАТИ И СТУДИЯ ВНЕШНОСТИ (CLOUDFLARE FLUX + GEMINI)
+# ХУДОЖЕСТВЕННАЯ МАСТЕРСКАЯ КАТИ (NOVELAI 4.5 ЧЕРЕЗ NAISTERA API)
 # ==========================
 
-CLOUDFLARE_IMAGE_URL = "https://dark-fire-6107.inetlesya.workers.dev/prompt/"
+NAISTERA_TOKEN = "idy2drmWUZ_obZ4tQhFSUQdr"
+NAISTERA_BASE_URL = "https://naistera.org"
+
+# Эталонный негативный промпт для NovelAI V4 / V4.5
+NOVELAI_NEGATIVE_PROMPT = (
+    "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, "
+    "fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, "
+    "signature, watermark, username, blurry, bad feet, poorly drawn face, mutation, deformed"
+)
+
+# Кэш точного названия модели V4.5 из API Наистеры
+CACHED_NAISTERA_MODEL = None
+
+async def _get_naistera_v45_model():
+    """Получает точный идентификатор модели 4.5 из каталога Наистеры для твоего токена."""
+    global CACHED_NAISTERA_MODEL
+    if CACHED_NAISTERA_MODEL:
+        return CACHED_NAISTERA_MODEL
+
+    fallback_model = "nai-diffusion-4.5-full"
+    headers = {"Authorization": f"Bearer {NAISTERA_TOKEN}"}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{NAISTERA_BASE_URL}/api/models", headers=headers)
+            if resp.status_code == 200:
+                models_data = resp.json()
+                models_list = models_data if isinstance(models_data, list) else models_data.get("models", [])
+                
+                # Ищем модель 4.5 среди доступных
+                candidates = []
+                for m in models_list:
+                    m_id = m.get("id") if isinstance(m, dict) else str(m)
+                    if "4.5" in m_id.lower() or "v4.5" in m_id.lower():
+                        candidates.append(m_id)
+                    elif "v4" in m_id.lower() or "novelai" in m_id.lower():
+                        candidates.append(m_id)
+
+                if candidates:
+                    CACHED_NAISTERA_MODEL = candidates[0]
+                    return CACHED_NAISTERA_MODEL
+    except Exception as e:
+        print("Не удалось запросить список моделей Наистеры, используем дефолт:", e)
+
+    CACHED_NAISTERA_MODEL = fallback_model
+    return CACHED_NAISTERA_MODEL
+
+
+async def _call_naistera_worker(tags_prompt, aspect_ratio="portrait"):
+    """
+    Выполняет генерацию арта через API Наистеры (NovelAI 4.5)
+    с поддержкой синхронного ответа, base64 и фоновой очереди (job polling).
+    """
+    model_name = await _get_naistera_v45_model()
+    headers = {
+        "Authorization": f"Bearer {NAISTERA_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    # Очищаем теги от случайных спецсимволов
+    clean_tags = re.sub(r'[\r\n"«»`#]+', ' ', tags_prompt).strip()
+    clean_tags = re.sub(r'\s{2,}', ' ', clean_tags)[:1200]
+
+    payload = {
+        "prompt": clean_tags,
+        "negative_prompt": NOVELAI_NEGATIVE_PROMPT,
+        "model": model_name,
+        "aspect_ratio": aspect_ratio,  # portrait (2:3), square (1:1), landscape (3:2)
+        "sync": True
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=100.0, follow_redirects=True) as client:
+            resp = await client.post(f"{NAISTERA_BASE_URL}/api/generate", json=payload, headers=headers)
+
+            # 1. Прямой бинарный ответ с картинкой
+            content_type = resp.headers.get("content-type", "").lower()
+            if resp.status_code == 200 and content_type.startswith("image/"):
+                img_bytes = io.BytesIO(resp.content)
+                img_bytes.name = "katya_art.png"
+                return img_bytes, clean_tags, None
+
+            # 2. JSON-ответ (base64, URL или job_id)
+            if resp.status_code == 200:
+                data = resp.json()
+
+                # Вариант base64
+                b64_img = data.get("image") or data.get("image_base64")
+                if b64_img:
+                    raw_b = base64.b64decode(b64_img.split(",")[-1])
+                    img_bytes = io.BytesIO(raw_b)
+                    img_bytes.name = "katya_art.png"
+                    return img_bytes, clean_tags, None
+
+                # Вариант прямой URL
+                img_url = data.get("url") or data.get("image_url")
+                if img_url:
+                    img_resp = await client.get(img_url)
+                    img_bytes = io.BytesIO(img_resp.content)
+                    img_bytes.name = "katya_art.png"
+                    return img_bytes, clean_tags, None
+
+                # Вариант очереди ожидания (polling)
+                job_id = data.get("job_id") or data.get("id")
+                if job_id:
+                    for _ in range(40):  # Ждем до 80 секунд
+                        await asyncio.sleep(2)
+                        job_resp = await client.get(f"{NAISTERA_BASE_URL}/api/generate/jobs/{job_id}", headers=headers)
+                        if job_resp.status_code == 200:
+                            jdata = job_resp.json()
+                            status = jdata.get("status", "").lower()
+                            if status in ["completed", "done", "success"]:
+                                res_url = (jdata.get("result") or {}).get("url") or jdata.get("url")
+                                if res_url:
+                                    img_get = await client.get(res_url)
+                                    img_bytes = io.BytesIO(img_get.content)
+                                    img_bytes.name = "katya_art.png"
+                                    return img_bytes, clean_tags, None
+                            elif status in ["failed", "error"]:
+                                return None, clean_tags, "Генератор Наистеры не смог завершить картину."
+
+            err_body = resp.text[:300] if resp.text else f"HTTP {resp.status_code}"
+            print("Ошибка ответа Наистеры:", resp.status_code, err_body)
+            if "limit" in err_body.lower() or "quota" in err_body.lower() or resp.status_code == 429:
+                return None, clean_tags, "Исчерпан лимит генераций по токену в боте Наистеры."
+            return None, clean_tags, f"Художественная мастерская Наистеры ответила ошибкой ({resp.status_code})."
+
+    except Exception as e:
+        print("Ошибка соединения с сервером Наистеры:", e)
+        return None, clean_tags, "Мастерская Наистеры сейчас не отвечает. Попробуйте повторить запрос чуть позже."
+
 
 def find_active_char_location(user_id, tg_user_id):
-    """Находит ключ чата, индекс и сам словарь активного персонажа (работает и в ЛС, и после рестарта)."""
+    """Находит ключ чата, индекс и сам словарь активного персонажа."""
     db = load_characters()
     chars = db.get(user_id, [])
     if chars:
@@ -846,6 +976,7 @@ def find_active_char_location(user_id, tg_user_id):
             return k, idx, v[idx]
     return None, None, None
 
+
 def get_real_active_character(user_id, tg_user_id):
     """Возвращает словарь реального активного персонажа."""
     if user_id in ACTIVE_CHARACTER and ACTIVE_CHARACTER[user_id]:
@@ -853,8 +984,9 @@ def get_real_active_character(user_id, tg_user_id):
     _, _, char_obj = find_active_char_location(user_id, tg_user_id)
     return char_obj
 
+
 def save_character_at_location(target_uid, char_idx, char_obj):
-    """Сохраняет изменения конкретного персонажа по его точному ключу и индексу."""
+    """Сохраняет изменения конкретного персонажа."""
     if not target_uid or char_obj is None:
         return
     chars = get_characters(target_uid)
@@ -864,8 +996,8 @@ def save_character_at_location(target_uid, char_idx, char_obj):
     if target_uid in ACTIVE_CHARACTER and ACTIVE_CHARACTER[target_uid].get("name") == char_obj.get("name"):
         ACTIVE_CHARACTER[target_uid] = char_obj
 
+
 def _name_in_text(full_name, text_low):
-    """Проверяет, упомянуто ли имя персонажа в тексте (с учётом русских падежей)."""
     for part in str(full_name or "").split():
         p = part.lower().strip(".,!?«»\"'")
         if len(p) < 3:
@@ -875,25 +1007,30 @@ def _name_in_text(full_name, text_low):
             return True
     return False
 
-def get_studio_markup(owner_id, has_art_app=False, multi_chars=False):
-    """Кнопки управления арт-внешностью персонажа (/студия)."""
+
+def get_studio_markup(owner_id, has_art_app=False, multi_chars=False, has_art_style=False):
     rows = [
         [InlineKeyboardButton("📸 Задать внешность по фото", callback_data=f"studio:photo:{owner_id}")],
-        [InlineKeyboardButton("✍️ Написать внешность текстом", callback_data=f"studio:text:{owner_id}")]
+        [InlineKeyboardButton("✍️ Написать внешность текстом", callback_data=f"studio:text:{owner_id}")],
+        [InlineKeyboardButton("🎨 Задать свой стиль (теги)", callback_data=f"studio:style:{owner_id}")]
     ]
     if has_art_app:
         rows.append([
-            InlineKeyboardButton("✏️ Внести корректировки", callback_data=f"studio:edit:{owner_id}"),
-            InlineKeyboardButton("🗑️ Сбросить", callback_data=f"studio:reset:{owner_id}")
+            InlineKeyboardButton("✏️ Правки внешности", callback_data=f"studio:edit:{owner_id}"),
+            InlineKeyboardButton("🗑️ Сброс внешности", callback_data=f"studio:reset:{owner_id}")
         ])
+    if has_art_style:
+        rows.append([InlineKeyboardButton("🧹 Сбросить свой стиль", callback_data=f"studio:reset_style:{owner_id}")])
     if multi_chars:
         rows.append([InlineKeyboardButton("👥 Сменить персонажа", callback_data=f"studio:chars:{owner_id}")])
     rows.append([InlineKeyboardButton("❌ Закрыть", callback_data=f"reg:close:{owner_id}")])
     return InlineKeyboardMarkup(rows)
 
+
 def format_studio_card(char):
     c_name = html.escape(str(char.get("name", "Безымянный")))
     art_app = char.get("art_appearance", "").strip()
+    art_style = char.get("art_style", "").strip()
     base_app = char.get("appearance", "—").strip()
 
     if art_app:
@@ -901,84 +1038,63 @@ def format_studio_card(char):
     else:
         app_block = (
             f"📄 <b>Особая арт-внешность:</b> <i>пока не задана</i>\n"
-            f"<i>(Сейчас при упоминании этого героя в /нарисуй используется внешность из анкеты: {html.escape(base_app[:220])})</i>"
+            f"<i>(Используется описание из анкеты: {html.escape(base_app[:220])})</i>"
         )
+
+    if art_style:
+        style_block = f"🎨 <b>Личный стиль генерации:</b>\n<code>{html.escape(art_style)}</code>"
+    else:
+        style_block = "🎨 <b>Личный стиль генерации:</b> <i>стандартный (не задан)</i>"
 
     body = (
         f"👤 <b>Персонаж:</b> {c_name}\n"
         f"│────────✤────────│\n"
         f"{app_block}\n\n"
-        f"💡 <i>Когда арт-внешность задана, просто пишите команду <code>/нарисуй</code> или <code>/арт</code> с именем персонажа или словами «мой персонаж» — она автоматически подхватится в любом нужном вам стиле!</i>"
+        f"{style_block}\n"
+        f"📖 <a href=\"https://t.me/stella2139/9773\">Здесь можно посмотреть стили и теги художников</a>\n"
+        f"│────────✤────────│\n"
+        f"💡 <i>При вызове <code>/нарисуй</code> или <code>/арт</code> сохранённая внешность и ваш личный стиль подставятся автоматически!</i>"
     )
-    return f"🎨 <b>АРТ-ПРОФИЛЬ ПЕРСОНАЖА</b>\n<blockquote expandable>{body}</blockquote>"
+    return f"🎨 <b>АРТ-ПРОФИЛЬ ПЕРСОНАЖА (NOVELAI 4.5)</b>\n<blockquote expandable>{body}</blockquote>"
+
 
 async def describe_character_photo_for_art(image):
-    """Через Gemini Vision детально распознает внешность персонажа по присланной картинке/фото."""
     prompt = """
 Рассмотри изображение персонажа максимально внимательно.
-Составь подробное, точное описание его внешности НА РУССКОМ ЯЗЫКЕ (3-5 предложений, без лишних вступлений).
-ОБЯЗАТЕЛЬНО опиши:
-- Пол и примерный возраст.
-- Волосы (точный цвет, оттенок, длина, прическа, чёлка, локоны).
-- Глаза (цвет, разрез, взгляд) и черты лица (кожа, веснушки, очки, шрамы, усы/борода, ушки если есть).
-- Телосложение и характерную одежду/аксессуары (цвета, материалы, украшения).
-
-Выведи ТОЛЬКО само описание внешности обычным текстом.
+Составь подробное описание его внешности НА РУССКОМ ЯЗЫКЕ (3-5 предложений).
+Опиши: пол, примерный возраст, точный цвет/длину/форму волос, цвет глаз, черты лица, телосложение и характерную одежду.
+Выведи ТОЛЬКО само описание обычным текстом.
 """
     desc, err = await generate_gemini_text_safe([prompt, image], model_name=MODEL_SMART)
     if err or not desc:
         desc, err = await generate_gemini_text_safe([prompt, image], model_name=MODEL_LITE)
     return desc, err
 
+
 async def edit_art_appearance_with_ai(current_appearance, user_edits):
-    """Аккуратно вносит точечные правки в сохранённую арт-внешность персонажа."""
     prompt = f"""
-Вот текущее описание внешности персонажа:
+Текущее описание внешности:
 "{current_appearance}"
 
-Пользователь просит внести следующие корректировки:
+Пользователь просит изменить:
 "{user_edits}"
 
-Перепиши описание внешности НА РУССКОМ ЯЗЫКЕ, сохранив всё остальное, но точно применив запрошенные изменения.
-Выведи ТОЛЬКО итоговое обновлённое описание одним связным текстом (без кавычек и пояснений).
+Перепиши описание внешности НА РУССКОМ ЯЗЫКЕ, сохранив всё остальное, но точно внедрив запрошенные правки.
+Выведи ТОЛЬКО итоговый обновленный текст.
 """
     updated, err = await generate_gemini_text_safe(prompt, model_name=MODEL_SMART)
     if err or not updated:
         updated, err = await generate_gemini_text_safe(prompt, model_name=MODEL_LITE)
     return updated, err
 
-async def _call_cloudflare_worker(eng_prompt):
-    """Выполняет HTTP-запрос к Cloudflare Worker и возвращает байты картинки или понятную ошибку."""
-    eng_prompt = re.sub(r'[\n\r"«»`/?#]+', ' ', eng_prompt)
-    eng_prompt = re.sub(r'\s{2,}', ' ', eng_prompt).strip()[:850]
-
-    encoded_prompt = urllib.parse.quote(eng_prompt, safe="")
-    request_url = f"{CLOUDFLARE_IMAGE_URL}{encoded_prompt}"
-
-    try:
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-            resp = await client.get(request_url)
-            content_type = resp.headers.get("content-type", "").lower()
-
-            if resp.status_code == 200 and content_type.startswith("image/") and len(resp.content) > 500:
-                img_bytes = io.BytesIO(resp.content)
-                img_bytes.name = "katya_art.jpg"
-                return img_bytes, eng_prompt, None
-
-            err_body = resp.text[:350] if resp.text else f"HTTP {resp.status_code}"
-            print("Ошибка ответа Cloudflare Worker:", resp.status_code, content_type, err_body)
-            if "3030" in err_body or "nsfw" in err_body.lower():
-                return None, eng_prompt, "Цензура нейросети Cloudflare заблокировала этот запрос (фильтр 3030). Попробуйте сформулировать описание чуть мягче."
-            return None, eng_prompt, "Я уронила палитру — картину не удалось завершить (возможно, исчерпан дневной лимит холстов)."
-    except Exception as e:
-        print("Ошибка соединения с Cloudflare Worker:", e)
-        return None, eng_prompt, "Художественная лавка сейчас не отвечает. Попробуйте повторить запрос чуть позже."
 
 async def build_art_prompt_with_ai(user_request, active_char=None, chat_id=None):
-    """Глубоко перерабатывает запрос игрока в роскошный промпт для FLUX без навязывания лишних персонажей."""
+    """
+    Генерирует специализированный промпт из Danbooru-тегов через запятую для NovelAI 4.5
+    с поддержкой личного стиля из студии, авторов и реестра персонажей.
+    """
     req_low = user_request.lower()
 
-    # Строгая проверка на упоминание себя / своего персонажа (без бага с подстрокой 'я ')
     self_phrases = [
         "мой персонаж", "моего персонажа", "моему персонажу", "моим персонажем",
         "моя героиня", "мою героиню", "моей героини", "мой герой", "моего героя",
@@ -994,7 +1110,6 @@ async def build_art_prompt_with_ai(user_request, active_char=None, chat_id=None)
     if wants_self and active_char:
         used_chars.append(("Персонаж игрока", active_char))
 
-    # Если в запросе названо имя другого персонажа из чата — берём его внешность
     if chat_id:
         for _, tc in get_all_active_characters(filter_chat_id=chat_id):
             if active_char and tc.get("name") == active_char.get("name") and wants_self:
@@ -1005,110 +1120,122 @@ async def build_art_prompt_with_ai(user_request, active_char=None, chat_id=None)
     char_context = ""
     used_names = []
     if used_chars:
-        char_context = "\n🚨 ДАННЫЕ УПОМЯНУТОГО ПЕРСОНАЖА (ВКЛЮЧИ КАЖДУЮ ДЕТАЛЬ ВНЕШНОСТИ В ПРОМПТ!):\n"
+        char_context = "\n🚨 ДАННЫЕ ПЕРСОНАЖА (ПЕРЕВЕДИ КАЖДУЮ ДЕТАЛЬ В АНГЛИЙСКИЕ DANBOORU-ТЕГИ!):\n"
         for role_label, ch in used_chars:
             used_names.append(ch.get("name", "Персонаж"))
             chosen_app = (ch.get("art_appearance") or "").strip() or ch.get("appearance", "—")
             char_context += (
                 f"[{role_label}: {ch.get('name', '—')}]\n"
                 f"- Пол и возраст: {ch.get('gender', '—')}, {ch.get('age', '—')}\n"
-                f"- Титул / Сословие: {ch.get('title', '—')} / {ch.get('estate', '—')}\n"
-                f"- ВНЕШНОСТЬ (переведи на английский максимально точно): {chosen_app}\n\n"
+                f"- Внешность и одежда: {chosen_app}\n\n"
             )
 
+    personal_style = (active_char.get("art_style") or "").strip() if active_char else ""
+    personal_style_block = ""
+    if personal_style:
+        personal_style_block = (
+            f"\n🎨 ЛИЧНЫЙ СОХРАНЁННЫЙ СТИЛЬ ПОЛЬЗОВАТЕЛЯ (ИЗ СТУДИИ):\n"
+            f'"{personal_style}"\n'
+            f"ОБЯЗАТЕЛЬНО включи эти теги стиля/художников в итоговый промпт (если пользователь в текущем запросе прямо не попросил другой стиль)!\n"
+        )
+
     prompt = f"""
-Ты — элитный арт-директор и мастер-промптер для нейросети FLUX.1 Schnell.
-Запрос пользователя:
-"{user_request}"
-{char_context}
+Ты — профессиональный мастер-промптер для нейросети NovelAI Diffusion 4.5.
+Запрос пользователя: "{user_request}"
+{char_context}{personal_style_block}
 
-ТВОЯ ЗАДАЧА — переработать и максимально обогатить идею пользователя в ОДИН подробный, кинематографичный и выразительный промпт НА АНГЛИЙСКОМ ЯЗЫКЕ (от 60 до 110 слов).
+ТВОЯ ЗАДАЧА — составить список Danbooru-тегов на английском языке через запятую.
 
-ПРАВИЛА ПЕРЕРАБОТКИ:
-1. ВНЕШНОСТЬ (если приложен блок персонажа выше): дословно переведи на английский и вплети в кадр КАЖДУЮ деталь (пол, возраст, цвет и длину волос, цвет глаз, черты лица, особенности, одежду), ничего не выдумывая вместо неё.
-2. УВАЖЕНИЕ К ЗАПРОШЕННОМУ СТИЛЮ:
-   - Если пользователь указал конкретный стиль (например: аниме, «в стиле Некопара», манга, визуальная новелла, Гибли, Аркейн, акварель, пиксель-арт, 3D) — СТРОГО выдержи именно этот стиль! Раскрой характерные художественные черты этого стиля (например, для Некопара/визуальной новеллы: *2D Japanese bishoujo visual novel CG illustration, soft glossy pastel anime art, luminous expressive anime eyes with rich highlights, delicate crisp lineart, cel shading*) и КАТЕГОРИЧЕСКИ НЕ пиши слова фотореализма (*photorealistic, 35mm, skin pores, real photo, oil painting*).
-   - Если пользователь НЕ указал стиль — используй богатую, универсально красивую художественную подачу (cinematic composition, rich atmospheric lighting, intricate textures, sharp focus, masterpiece quality; для тем XIX века/дворянства добавь элегантную атмосферу 1838 Imperial Russian aesthetics).
-3. ДЕТАЛИЗАЦИЯ: Проработай композицию, свет (rim light, warm glow, soft shadows, volumetric rays), фактуры и детали окружения, чтобы картинка выглядела шедеврально.
-4. ФОРМАТ ВЫВОДА:
-   - Верни ТОЛЬКО готовый английский текст одной строкой! Без кавычек, вступлений, переносов строк и символов `/`, `?`, `#`.
-   - Длина от 350 до 850 символов.
+ПРАВИЛА СОСТАВЛЕНИЯ ТЕГОВ ДЛЯ NOVELAI 4.5:
+1. СТРОГИЙ ФОРМАТ: ТОЛЬКО теги через запятую! НИКАКИХ предложений, точек и описательных абзацев.
+2. ОБЯЗАТЕЛЬНЫЙ СТАРТ: всегда начинай с: `masterpiece, best quality, `
+3. ХУДОЖНИКИ И СТИЛИ:
+   - Если у пользователя задан ЛИЧНЫЙ СТИЛЬ выше — обязательно перенеси или адаптируй его теги в начало промпта (сразу после `masterpiece, best quality, `). Готовые теги вроде `artist:...`, фигурные скобки `{{...}}` оставляй как есть!
+   - Если пользователь в самом запросе указал стиль художника (например: "в стиле WLOP", "в стиле Мухи") — используй точный Danbooru-тег: `artist:wlop`, `artist:alphonse mucha`.
+   - Если никаких стилей нигде нет — добавь: `aesthetic, intricate details, atmospheric lighting`.
+4. КОЛИЧЕСТВО ЛЮДЕЙ И ТЕГИ ПОЛА (если указан блок персонажа):
+   - Если персонаж один: `1girl, solo` или `1boy, solo`
+   - Если персонажей двое или пара: ОБЯЗАТЕЛЬНО укажи `2people`, `1boy, 1girl` (или `2girls` / `2boys`) и КАТЕГОРИЧЕСКИ НЕ используй тег `solo`!
+   - Для каждого персонажа опиши цвет и длину волос, цвет глаз, одежду и позу.
+5. ФОН: опиши окружение тегами (`winter palace, snow, night, candlelight, interior`).
+6. ДЛИНА: от 20 до 45 тегов. Верни ТОЛЬКО готовую строку тегов!
 """
-    eng_prompt, err = await generate_gemini_text_safe(prompt, model_name=MODEL_SMART)
-    if err or not eng_prompt:
-        eng_prompt, err = await generate_gemini_text_safe(prompt, model_name=MODEL_LITE)
+    tags_prompt, err = await generate_gemini_text_safe(prompt, model_name=MODEL_SMART)
+    if err or not tags_prompt:
+        tags_prompt, err = await generate_gemini_text_safe(prompt, model_name=MODEL_LITE)
 
-    if not eng_prompt:
-        fallback_parts = [user_request]
-        for _, ch in used_chars:
-            app_val = (ch.get("art_appearance") or "").strip() or ch.get("appearance", "")
-            fallback_parts.append(f"{ch.get('gender', '')} {ch.get('age', '')} {app_val}")
-        eng_prompt = ", ".join(p for p in fallback_parts if p) + ", highly detailed, cinematic lighting, rich textures, masterpiece"
+    if not tags_prompt:
+        base_style = f"{personal_style}, " if personal_style else ""
+        tags_prompt = f"masterpiece, best quality, {base_style}{user_request}, 19th century imperial russia, highly detailed"
 
-    eng_prompt = re.sub(r'[\n\r"«»`/?#]+', ' ', eng_prompt)
-    eng_prompt = re.sub(r'\s{2,}', ' ', eng_prompt).strip()
-    return eng_prompt[:850], used_names
+    tags_prompt = re.sub(r'[\n\r"«»`/?#]+', ' ', tags_prompt).strip()
+    return tags_prompt, used_names
+
 
 async def generate_katya_art(user_request, active_char=None, chat_id=None):
-    """Генерирует обогащенный промпт по запросу и запрашивает картинку у Cloudflare Worker."""
-    eng_prompt, used_names = await build_art_prompt_with_ai(
+    """Генерирует арт через NovelAI 4.5 (Наистера)."""
+    tags_prompt, used_names = await build_art_prompt_with_ai(
         user_request, active_char=active_char, chat_id=chat_id
     )
-    img_bytes, clean_eng, err = await _call_cloudflare_worker(eng_prompt)
-    return img_bytes, clean_eng, used_names, err
+    img_bytes, clean_tags, err = await _call_naistera_worker(tags_prompt, aspect_ratio="portrait")
+    return img_bytes, clean_tags, used_names, err
+
 
 async def build_context_art_prompt(user_request, user_id, replied_text="", active_char=None):
-    """Собирает всю память диалога + визуальную память + ответное сообщение для рисования того, что обсуждалось."""
+    """Преобразует обсуждение из памяти диалога в точные теги для NovelAI 4.5."""
     history = get_memory(user_id)[-18:]
     visual_memory = get_visual_memory(user_id)[-6:]
 
     hist_str = "\n".join(str(m) for m in history) if history else "Истории почти нет."
     vis_str = "\n".join(str(v) for v in visual_memory) if visual_memory else "Нет."
-    rep_str = f'\nКонкретное сообщение, на которое ответил пользователь:\n"{replied_text}"\n' if replied_text else ""
+    rep_str = f'\nСообщение, на которое ответил пользователь:\n"{replied_text}"\n' if replied_text else ""
 
     char_str = ""
+    personal_style_str = ""
     if active_char:
         app_val = (active_char.get("art_appearance") or "").strip() or active_char.get("appearance", "—")
         char_str = (
-            f"\nДанные персонажа игрока (используй, только если обсуждаемый предмет/наряд надевается на персонажа или речь шла о нём): "
-            f"{active_char.get('name')}, {active_char.get('gender')}, {active_char.get('age')}, внешность: {app_val}\n"
+            f"\nДанные персонажа: {active_char.get('name')}, {active_char.get('gender')}, "
+            f"{active_char.get('age')}, внешность: {app_val}\n"
         )
+        p_style = (active_char.get("art_style") or "").strip()
+        if p_style:
+            personal_style_str = f"\n🎨 ЛИЧНЫЙ СТИЛЬ ПОЛЬЗОВАТЕЛЯ (обязательно добавь в теги): {p_style}\n"
 
     prompt = f"""
-Ты — элитный арт-директор и промпт-инженер для нейросети FLUX.1 Schnell.
-Пользователь сейчас в беседе попросил: "{user_request}"
-(То есть нарисовать именно то, что вы с ним обсуждали в диалоге — дизайн платья, интерьер, сцену, украшение, предмет или образ!)
+Ты — мастер-промптер Danbooru для NovelAI Diffusion 4.5.
+Пользователь попросил нарисовать то, что обсуждалось в диалоге: "{user_request}"
 
-📜 ПОСЛЕДНЯЯ ПАМЯТЬ ДИАЛОГА:
+📜 ИСТОРИЯ ДИАЛОГА:
 {hist_str}
 
-👁️ ВИЗУАЛЬНАЯ ПАМЯТЬ ОБСУЖДАВШИХСЯ КАРТИНОК:
+👁️ ВИЗУАЛЬНАЯ ПАМЯТЬ:
 {vis_str}
-{rep_str}{char_str}
+{rep_str}{char_str}{personal_style_str}
 
 ТВОЯ ЗАДАЧА:
-1. Внимательно проанализируй память диалога и пойми, ЧТО ИМЕННО вы обсуждали (какой фасон платья, какие цвета, ткани, узоры, детали, обстановку или персонажа).
-2. Объедини все обговорённые детали в ОДИН подробный, роскошный визуальный промпт НА АНГЛИЙСКОМ ЯЗЫКЕ (от 60 до 110 слов).
-3. Если в запросе или обсуждении упоминался конкретный стиль (аниме, Некопара, акварель и т.д.) — строго выдержи его. Иначе используй красивую, детальную кинематографичную/живописную подачу с проработкой фактур и света.
-4. Верни ТОЛЬКО готовый английский текст одной строкой! Никаких пояснений, кавычек и символов `/`, `?`, `#`. Длина от 350 до 850 символов.
+1. Вычлени из обсуждения все детали (фасон платья, ткани, цвета, украшения, интерьер, персонажа).
+2. Сформируй Danbooru-теги через запятую на английском языке для NovelAI 4.5.
+3. Обязательно начни с: `masterpiece, best quality, ` и добавь личный стиль пользователя, если он указан выше.
+4. Верни ТОЛЬКО строку тегов через запятую!
 """
-    eng_prompt, err = await generate_gemini_text_safe(prompt, model_name=MODEL_SMART)
-    if err or not eng_prompt:
-        eng_prompt, err = await generate_gemini_text_safe(prompt, model_name=MODEL_LITE)
+    tags_prompt, err = await generate_gemini_text_safe(prompt, model_name=MODEL_SMART)
+    if err or not tags_prompt:
+        tags_prompt, err = await generate_gemini_text_safe(prompt, model_name=MODEL_LITE)
 
-    if not eng_prompt:
-        eng_prompt = f"{replied_text or user_request}, intricate details, cinematic lighting, masterpiece"
+    if not tags_prompt:
+        tags_prompt = f"masterpiece, best quality, {replied_text or user_request}, 19th century, detailed"
 
-    eng_prompt = re.sub(r'[\n\r"«»`/?#]+', ' ', eng_prompt)
-    eng_prompt = re.sub(r'\s{2,}', ' ', eng_prompt).strip()
-    return eng_prompt[:850]
+    tags_prompt = re.sub(r'[\n\r"«»`/?#]+', ' ', tags_prompt).strip()
+    return tags_prompt
+
 
 async def generate_katya_art_from_context(user_request, user_id, replied_text="", active_char=None):
-    """Рисует объект/дизайн/сцену из памяти текущего обсуждения с Катей."""
-    eng_prompt = await build_context_art_prompt(
+    """Рисует сцену или наряд из контекста переписки через NovelAI 4.5."""
+    tags_prompt = await build_context_art_prompt(
         user_request, user_id, replied_text=replied_text, active_char=active_char
     )
-    return await _call_cloudflare_worker(eng_prompt)
+    return await _call_naistera_worker(tags_prompt, aspect_ratio="portrait")
 
 # ==========================
 # ГЕНЕРАТОР СВЕТСКИХ СОВЕТОВ ПО ОТЫГРЫШУ (/совет)
@@ -2087,7 +2214,7 @@ name, age, gender, title, estate, nationality, family, appearance, personality, 
         raw_clean = raw.replace("```json", "").replace("```", "").strip()
         updated_data = json.loads(raw_clean)
         
-        for key in ["changes", "achievement_times", "status_times", "stats", "katya_relationship", "art_appearance"]:
+        for key in ["changes", "achievement_times", "status_times", "stats", "katya_relationship", "art_appearance", "art_style"]:
             if key in current_char:
                 updated_data[key] = current_char[key]
                 
@@ -3593,7 +3720,7 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("// Ошибка: персонаж не найден.")
         return
 
-    # СТУДИЯ ВНЕШНОСТИ ПЕРСОНАЖА (CALLBACKS)
+# СТУДИЯ ВНЕШНОСТИ ПЕРСОНАЖА (CALLBACKS)
     if action_prefix == "studio":
         sub = parts[1]
         target_uid, char_idx, char = find_active_char_location(user_id_str, clicker_user_id)
@@ -3608,7 +3735,7 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             kb_btns = [[InlineKeyboardButton(f"{i}. {c.get('name')}", callback_data=f"studio:selchar:{i-1}:{clicker_user_id}")] for i, c in enumerate(chars, 1)]
             kb_btns.append([InlineKeyboardButton("❌ Назад", callback_data=f"studio:back:{clicker_user_id}")])
-            await query.edit_message_text("// Выберите персонажа для настройки арт-внешности:", reply_markup=InlineKeyboardMarkup(kb_btns))
+            await query.edit_message_text("// Выберите персонажа для настройки арт-внешности и стиля:", reply_markup=InlineKeyboardMarkup(kb_btns))
             return
 
         if sub == "selchar":
@@ -3621,14 +3748,53 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ACTIVE_CHARACTER[target_uid] = chars[char_idx]
                 char = chars[char_idx]
 
-        if sub in ["back", "selchar", "reset", "text", "edit", "photo"]:
+        if sub in ["back", "selchar", "reset", "reset_style", "text", "edit", "photo", "style"]:
             if sub == "reset":
                 char.pop("art_appearance", None)
                 save_character_at_location(target_uid, char_idx, char)
                 await query.edit_message_text(
                     f"// Сброшено! Арт-внешность персонажа <b>{html.escape(char.get('name'))}</b> очищена.\n\n{format_studio_card(char)}",
-                    reply_markup=get_studio_markup(clicker_user_id, has_art_app=bool(char.get("art_appearance")), multi_chars=len(get_characters(target_uid))>1),
-                    parse_mode="HTML"
+                    reply_markup=get_studio_markup(
+                        clicker_user_id,
+                        has_art_app=bool(char.get("art_appearance")),
+                        multi_chars=len(get_characters(target_uid)) > 1,
+                        has_art_style=bool(char.get("art_style"))
+                    ),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+                return
+
+            if sub == "reset_style":
+                char.pop("art_style", None)
+                save_character_at_location(target_uid, char_idx, char)
+                await query.edit_message_text(
+                    f"// Личный стиль персонажа <b>{html.escape(char.get('name'))}</b> сброшен на стандартный.\n\n{format_studio_card(char)}",
+                    reply_markup=get_studio_markup(
+                        clicker_user_id,
+                        has_art_app=bool(char.get("art_appearance")),
+                        multi_chars=len(get_characters(target_uid)) > 1,
+                        has_art_style=False
+                    ),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+                return
+
+            if sub == "style":
+                context.user_data["waiting_studio_style"] = True
+                context.user_data["studio_target_uid"] = target_uid
+                context.user_data["studio_char_idx"] = char_idx
+                await query.edit_message_text(
+                    f"// 🎨 Напишите теги стиля или художника для персонажа <b>{html.escape(char.get('name'))}</b>, которые будут применяться именно к вашим генерациям.\n\n"
+                    f"<i>Примеры:\n"
+                    f"• <code>artist:wlop, dramatic lighting</code>\n"
+                    f"• <code>artist:alphonse mucha, watercolor</code>\n"
+                    f"• <code>в стиле аниме 90-х и акварель</code></i>\n\n"
+                    f"📖 <a href=\"https://t.me/stella2139/9773\">Здесь можно посмотреть стили</a>\n\n"
+                    f"<i>(Напишите теги ответным сообщением или отправьте «отмена»)</i>",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
                 )
                 return
 
@@ -3668,11 +3834,16 @@ async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await query.edit_message_text(
                 format_studio_card(char),
-                reply_markup=get_studio_markup(clicker_user_id, has_art_app=bool(char.get("art_appearance")), multi_chars=len(get_characters(target_uid))>1),
-                parse_mode="HTML"
+                reply_markup=get_studio_markup(
+                    clicker_user_id,
+                    has_art_app=bool(char.get("art_appearance")),
+                    multi_chars=len(get_characters(target_uid)) > 1,
+                    has_art_style=bool(char.get("art_style"))
+                ),
+                parse_mode="HTML",
+                disable_web_page_preview=True
             )
         return
-
     # 1.2 ОТНОШЕНИЕ КАТИ КО ВСЕМ ПЕРСОНАЖАМ В /мои_персонажи
     if action_prefix == "my_chars":
         sub = parts[1]
@@ -4180,9 +4351,12 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_private = update.effective_chat.type == "private"
     is_reply = bool(update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id)
 
-    # Очищаем @username_бота из /команда@бот в групповых чатах для мгновенного выполнения
+   # Очищаем @username_бота из /команда@бот в групповых чатах для мгновенного выполнения
     if text.startswith("/"):
         context.user_data.pop("waiting_studio_photo", None)
+        context.user_data.pop("waiting_studio_style", None)
+        context.user_data.pop("waiting_studio_text", None)
+        context.user_data.pop("waiting_studio_edit", None)
         parts_cmd = text.split(None, 1)
         clean_cmd = re.sub(r'@[a-zA-Z0-9_]+$', '', parts_cmd[0])
         if clean_cmd != parts_cmd[0]:
@@ -4221,7 +4395,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<b>🌐 Поиск и Картины:</b>\n"
             "• <code>/поиск [запрос]</code> (<code>/search</code>) — поиск актуальных сведений в интернете с прямыми ссылками. <i>Можно попросить: «не учитывай википедию» или «без dzen.ru»</i>.\n"
             "• <code>/арт [описание]</code> (<code>/нарисуй</code>, <code>/art</code>) — написать картину или портрет.\n"
-            "• <code>/студия</code> (<code>/studio</code>) — настроить особую арт-внешность своего персонажа по фотографии или тексту.\n\n"
+            "• <code>/студия</code> (<code>/studio</code>) — настроить особую арт-внешность (по фото/тексту) и личный стиль рисования для своего персонажа.\n\n"
             "<b>👤 Персонажи, Анкеты и Отношения:</b>\n"
             "• <code>/новая_анкета</code> (<code>/new_anketa</code>, <code>катя новая анкета</code>) — подать анкету ко двору.\n"
             "• <code>/мои_персонажи</code> (<code>/my_chars</code>) — переключение героев, личная дата рождения и отношение Кати ко всем персонажам.\n"
@@ -4278,7 +4452,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ==========================
-    # КОМАНДА /студия (/studio) — НАСТРОЙКА АРТ-ВНЕШНОСТИ
+    # КОМАНДА /студия (/studio) — НАСТРОЙКА АРТ-ВНЕШНОСТИ И СТИЛЯ
     # ==========================
     if lower in ["/студия", "/studio", "катя студия", "катя, студия"]:
         target_uid, char_idx, char = find_active_char_location(user_id, sender_user_id)
@@ -4287,8 +4461,42 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         card_txt = format_studio_card(char)
-        markup = get_studio_markup(sender_user_id, has_art_app=bool(char.get("art_appearance")), multi_chars=len(get_characters(target_uid)) > 1)
-        await update.message.reply_text(card_txt, reply_markup=markup, parse_mode="HTML")
+        markup = get_studio_markup(
+            sender_user_id,
+            has_art_app=bool(char.get("art_appearance")),
+            multi_chars=len(get_characters(target_uid)) > 1,
+            has_art_style=bool(char.get("art_style"))
+        )
+        await update.message.reply_text(card_txt, reply_markup=markup, parse_mode="HTML", disable_web_page_preview=True)
+        return
+
+    # ВВОД ЛИЧНОГО СТИЛЯ И ТЕГОВ
+    if context.user_data.get("waiting_studio_style"):
+        context.user_data.pop("waiting_studio_style", None)
+        target_uid = context.user_data.pop("studio_target_uid", user_id)
+        char_idx = context.user_data.pop("studio_char_idx", 0)
+
+        if lower in ["отмена", "стоп", "нет"]:
+            await update.message.reply_text("// Настройка стиля отменена.")
+            return
+
+        chars = get_characters(target_uid)
+        if 0 <= char_idx < len(chars):
+            char = chars[char_idx]
+            if lower in ["сброс", "сбросить", "очистить"]:
+                char.pop("art_style", None)
+                msg_prefix = f"// Личный стиль персонажа <b>{html.escape(char.get('name'))}</b> сброшен!"
+            else:
+                char["art_style"] = text.strip()
+                msg_prefix = f"// 🎨 Личный стиль сохранён для <b>{html.escape(char.get('name'))}</b>! Теперь ИИ будет использовать его в ваших генерациях."
+
+            save_character_at_location(target_uid, char_idx, char)
+            card_txt = format_studio_card(char)
+            await update.message.reply_text(
+                f"{msg_prefix}\n\n{card_txt}",
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
         return
 
     # ВВОД АРТ-ВНЕШНОСТИ ТЕКСТОМ
@@ -4309,7 +4517,8 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             card_txt = format_studio_card(char)
             await update.message.reply_text(
                 f"// Успешно сохранена новая арт-внешность для персонажа <b>{html.escape(char.get('name'))}</b>!\n\n{card_txt}",
-                parse_mode="HTML"
+                parse_mode="HTML",
+                disable_web_page_preview=True
             )
         return
 
@@ -4343,7 +4552,8 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             card_txt = format_studio_card(char)
             await update.message.reply_text(
                 f"// Внешность успешно обновлена!\n\n{card_txt}",
-                parse_mode="HTML"
+                parse_mode="HTML",
+                disable_web_page_preview=True
             )
         return
 
@@ -4775,6 +4985,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         or context.user_data.get("waiting_studio_text")
         or context.user_data.get("waiting_studio_edit")
         or context.user_data.get("waiting_studio_photo")
+        or context.user_data.get("waiting_studio_style")
     )
 
     # ==========================
