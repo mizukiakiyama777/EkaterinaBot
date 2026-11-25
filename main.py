@@ -825,7 +825,7 @@ USED_SOURCES: 1, 2
 # ХУДОЖЕСТВЕННАЯ МАСТЕРСКАЯ КАТИ (NOVELAI ЧЕРЕЗ NAISTERA LEGACY PROMPT)
 # ==========================
 
-NAISTERA_TOKEN = "idy2drmWUZ_obZ4tQhFSUQdr"
+NAISTERA_TOKEN = "x292aUIwo7hh1xIMjti13qHg"
 
 async def _call_naistera_worker(tags_prompt, aspect_ratio="portrait"):
     """
