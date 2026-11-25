@@ -4178,9 +4178,11 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lower = text.lower().strip()
     chat_id = update.effective_chat.id
     is_private = update.effective_chat.type == "private"
+    is_reply = bool(update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id)
 
     # Очищаем @username_бота из /команда@бот в групповых чатах для мгновенного выполнения
     if text.startswith("/"):
+        context.user_data.pop("waiting_studio_photo", None)
         parts_cmd = text.split(None, 1)
         clean_cmd = re.sub(r'@[a-zA-Z0-9_]+$', '', parts_cmd[0])
         if clean_cmd != parts_cmd[0]:
@@ -4215,7 +4217,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if lower in ["/помощь", "/help", "катя помощь", "катя, помощь", "катя команды"]:
         help_text = (
             "<b>📜 ИМПЕРАТОРСКИЙ СВОД ПРАВИЛ И КОМАНД (1838 ГОД)</b>\n"
-            "ㅤㅤ∴ ════ ∴ ✦ ════ ∴\n\n"
+            "ㅤㅤ∴ ════ ∴ ✦ ∴ ════ ∴\n\n"
             "<b>🌐 Поиск и Картины:</b>\n"
             "• <code>/поиск [запрос]</code> (<code>/search</code>) — поиск актуальных сведений в интернете с прямыми ссылками. <i>Можно попросить: «не учитывай википедию» или «без dzen.ru»</i>.\n"
             "• <code>/арт [описание]</code> (<code>/нарисуй</code>, <code>/art</code>) — написать картину или портрет.\n"
@@ -4345,6 +4347,13 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    if context.user_data.get("waiting_studio_photo") and lower in ["отмена", "стоп", "нет"]:
+        context.user_data.pop("waiting_studio_photo", None)
+        context.user_data.pop("studio_target_uid", None)
+        context.user_data.pop("studio_char_idx", None)
+        await update.message.reply_text("// Ожидание фото для арт-внешности отменено.")
+        return
+
     # ==========================
     # КОМАНДА /поиск (/search)
     # ==========================
@@ -4410,7 +4419,7 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_art_cmd = any(lower.startswith(pfx) for pfx in art_prefixes)
     is_context_art = (
         not is_art_cmd
-        and (is_reply and update.message.reply_to_message.from_user.id == context.bot.id)
+        and is_reply
         and any(w in lower for w in ["нарисуй", "изобрази", "воплоти", "набросай", "картин"])
     )
 
@@ -4429,14 +4438,18 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         working_msg = await update.message.reply_text(f"// *Берусь за кисти и мольберт...* Переношу замысел на холст для вас, {dear}! 🎨")
 
-        if is_context_art and not art_query.strip():
-            art_query = "нарисуй то, что мы сейчас обсуждали"
+        context_phrases = [
+            "это", "то что мы обсуждали", "то, что мы обсуждали",
+            "этот дизайн", "этот наряд", "это платье", "наше обсуждение"
+        ]
+        wants_context = is_context_art or (art_query.lower().strip(" .!?") in context_phrases) or (not art_query.strip() and is_reply)
 
-        # Если это обсуждение (ответ на сообщение Кати с просьбой нарисовать)
-        if is_context_art or (not art_query.strip() and is_reply):
-            replied_txt = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
+        if wants_context:
+            replied_txt = ""
+            if update.message.reply_to_message:
+                replied_txt = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
             img_io, eng_prompt, err = await generate_katya_art_from_context(
-                art_query or "нарисуй это", user_id, replied_text=replied_txt, active_char=active_char
+                art_query or "нарисуй то, что мы сейчас обсуждали", user_id, replied_text=replied_txt, active_char=active_char
             )
             used_names = []
         else:
@@ -4449,8 +4462,10 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "• <code>/арт дуэль на Черной речке в утреннем тумане</code></i>",
                     parse_mode="HTML"
                 )
-                try: await context.bot.delete_message(chat_id=chat_id, message_id=working_msg.message_id)
-                except Exception: pass
+                try:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=working_msg.message_id)
+                except Exception:
+                    pass
                 return
 
             img_io, eng_prompt, used_names, err = await generate_katya_art(
@@ -4744,8 +4759,6 @@ async def messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
         return
-
-    is_reply = update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id
 
     has_active_state = (
         user_id in WAITING_CHARACTER
@@ -6398,9 +6411,8 @@ def main():
     app.add_handler(CallbackQueryHandler(callbacks_handler))
     app.add_handler(MessageHandler(filters.TEXT, messages))
 
-    print("Екатерина запускается!")
+    print("Екатерина запущена!")
     app.run_polling(drop_pending_updates=True, timeout=30, bootstrap_retries=-1)
 
 if __name__ == "__main__":
     main()
-
