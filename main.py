@@ -822,33 +822,20 @@ USED_SOURCES: 1, 2
     return answer_text, sources_list, None
 
 # ==========================
-# ХУДОЖЕСТВЕННАЯ МАСТЕРСКАЯ КАТИ (NOVELAI ЧЕРЕЗ NAISTERA API)
+# ХУДОЖЕСТВЕННАЯ МАСТЕРСКАЯ КАТИ (NOVELAI ЧЕРЕЗ NAISTERA LEGACY PROMPT)
 # ==========================
 
 NAISTERA_TOKEN = "idy2drmWUZ_obZ4tQhFSUQdr"
-NAISTERA_BASE_URL = "https://naistera.org"
-
-# Эталонный негативный промпт для NovelAI
-NOVELAI_NEGATIVE_PROMPT = (
-    "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, "
-    "fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, "
-    "signature, watermark, username, blurry, bad feet, poorly drawn face, mutation, deformed"
-)
 
 async def _call_naistera_worker(tags_prompt, aspect_ratio="portrait"):
     """
-    Выполняет генерацию арта через официальный API Наистеры (как в SillyImages).
+    Генерирует арт через стабильный легаси-эндпоинт Наистеры /prompt/
     """
-    headers = {
-        "Authorization": f"Bearer {NAISTERA_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-    # Очищаем теги от мусора
+    # Очищаем теги от мусора и лишних пробелов
     clean_tags = re.sub(r'[\r\n"«»`#]+', ' ', tags_prompt).strip()
-    clean_tags = re.sub(r'\s{2,}', ' ', clean_tags)[:1200]
+    clean_tags = re.sub(r'\s{2,}', ' ', clean_tags)[:900]
 
-    # Превращаем portrait/landscape в пропорции, понятные Наистере
+    # Маппинг пропорций под легаси формат
     aspect_map = {
         "portrait": "2:3",
         "landscape": "3:2",
@@ -856,80 +843,35 @@ async def _call_naistera_worker(tags_prompt, aspect_ratio="portrait"):
     }
     ratio_str = aspect_map.get(aspect_ratio, "2:3")
 
-    # Точное тело запроса под спецификацию Naistera API
-    payload = {
-        "prompt": clean_tags,
-        "negative_prompt": NOVELAI_NEGATIVE_PROMPT,
-        "aspect_ratio": ratio_str,
-        "preset": "digital",
-        "sync": True
-    }
+    # Кодируем промпт в URL-формат
+    encoded_prompt = urllib.parse.quote(clean_tags, safe="")
+    
+    # Собираем легаси-ссылку точь-в-точь по документации Наистеры
+    request_url = f"https://naistera.org/prompt/{encoded_prompt}?preset=digital&aspect_ratio={ratio_str}&token={NAISTERA_TOKEN}"
 
     try:
-        async with httpx.AsyncClient(timeout=100.0, follow_redirects=True) as client:
-            resp = await client.post(f"{NAISTERA_BASE_URL}/api/generate", json=payload, headers=headers)
-
-            # 1. Если пришла прямая картинка
+        async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
+            resp = await client.get(request_url)
             content_type = resp.headers.get("content-type", "").lower()
-            if resp.status_code == 200 and content_type.startswith("image/"):
+
+            if resp.status_code == 200 and content_type.startswith("image/") and len(resp.content) > 500:
                 img_bytes = io.BytesIO(resp.content)
                 img_bytes.name = "katya_art.png"
                 return img_bytes, clean_tags, None
 
-            # 2. JSON-ответ (ссылка, base64 или job_id)
-            if resp.status_code == 200:
-                data = resp.json()
-
-                # Вариант base64
-                b64_img = data.get("image") or data.get("image_base64")
-                if b64_img:
-                    raw_b = base64.b64decode(b64_img.split(",")[-1])
-                    img_bytes = io.BytesIO(raw_b)
-                    img_bytes.name = "katya_art.png"
-                    return img_bytes, clean_tags, None
-
-                # Вариант прямой URL
-                img_url = data.get("url") or data.get("image_url") or data.get("result", {}).get("url")
-                if img_url:
-                    img_resp = await client.get(img_url)
-                    img_bytes = io.BytesIO(img_resp.content)
-                    img_bytes.name = "katya_art.png"
-                    return img_bytes, clean_tags, None
-
-                # Вариант фоновой очереди (job polling)
-                job_id = data.get("job_id") or data.get("id")
-                if job_id:
-                    for _ in range(40):  # Ждем до 80 секунд
-                        await asyncio.sleep(2)
-                        job_resp = await client.get(f"{NAISTERA_BASE_URL}/api/generate/jobs/{job_id}", headers=headers)
-                        if job_resp.status_code == 200:
-                            jdata = job_resp.json()
-                            status = str(jdata.get("status", "")).lower()
-                            if status in ["completed", "done", "success", "finished"]:
-                                res_url = (jdata.get("result") or {}).get("url") or jdata.get("url")
-                                if res_url:
-                                    img_get = await client.get(res_url)
-                                    img_bytes = io.BytesIO(img_get.content)
-                                    img_bytes.name = "katya_art.png"
-                                    return img_bytes, clean_tags, None
-                            elif status in ["failed", "error"]:
-                                return None, clean_tags, "Генератор Наистеры сообщил об ошибке задачи."
-
-            err_body = resp.text[:300] if resp.text else f"HTTP {resp.status_code}"
-            print(f"Ошибка ответа Наистеры [{resp.status_code}]:", err_body)
+            err_body = resp.text[:350] if resp.text else f"HTTP {resp.status_code}"
+            print("Ошибка ответа Наистеры (Legacy):", resp.status_code, content_type, err_body)
             
-            if resp.status_code == 400:
-                return None, clean_tags, "Наистера отклонила запрос (Ошибка 400). Проверьте правильность тегов или лимиты токена."
-            if resp.status_code in [401, 403]:
-                return None, clean_tags, "Ошибка авторизации в Наистере. Проверьте токен."
-            if resp.status_code == 429:
+            if resp.status_code == 410:
+                return None, clean_tags, "Эндпоинт Наистеры устарел (Ошибка 410). Потребуется уточнить актуальный адрес API."
+            if "quota" in err_body.lower() or "limit" in err_body.lower() or resp.status_code == 429:
                 return None, clean_tags, "Исчерпан лимит генераций по токену в Наистере."
                 
             return None, clean_tags, f"Художественная мастерская Наистеры ответила ошибкой ({resp.status_code})."
 
     except Exception as e:
-        print("Ошибка соединения с сервером Наистеры:", e)
-        return None, clean_tags, "Мастерская Наистеры сейчас не отвечает. Попробуйте повторить запрос чуть позже."
+        print("Ошибка соединения с Наистерой (Legacy):", e)
+        return None, clean_tags, "Мастерская Наистеры сейчас не отвечает. Попробуйте позже."
 
 
 def find_active_char_location(user_id, tg_user_id):
