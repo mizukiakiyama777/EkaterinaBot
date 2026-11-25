@@ -822,76 +822,46 @@ USED_SOURCES: 1, 2
     return answer_text, sources_list, None
 
 # ==========================
-# ХУДОЖЕСТВЕННАЯ МАСТЕРСКАЯ КАТИ (NOVELAI 4.5 ЧЕРЕЗ NAISTERA API)
+# ХУДОЖЕСТВЕННАЯ МАСТЕРСКАЯ КАТИ (NOVELAI ЧЕРЕЗ NAISTERA API)
 # ==========================
 
 NAISTERA_TOKEN = "idy2drmWUZ_obZ4tQhFSUQdr"
 NAISTERA_BASE_URL = "https://naistera.org"
 
-# Эталонный негативный промпт для NovelAI V4 / V4.5
+# Эталонный негативный промпт для NovelAI
 NOVELAI_NEGATIVE_PROMPT = (
     "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, "
     "fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, "
     "signature, watermark, username, blurry, bad feet, poorly drawn face, mutation, deformed"
 )
 
-# Кэш точного названия модели V4.5 из API Наистеры
-CACHED_NAISTERA_MODEL = None
-
-async def _get_naistera_v45_model():
-    """Получает точный идентификатор модели 4.5 из каталога Наистеры для твоего токена."""
-    global CACHED_NAISTERA_MODEL
-    if CACHED_NAISTERA_MODEL:
-        return CACHED_NAISTERA_MODEL
-
-    fallback_model = "nai-diffusion-4.5-full"
-    headers = {"Authorization": f"Bearer {NAISTERA_TOKEN}"}
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(f"{NAISTERA_BASE_URL}/api/models", headers=headers)
-            if resp.status_code == 200:
-                models_data = resp.json()
-                models_list = models_data if isinstance(models_data, list) else models_data.get("models", [])
-                
-                # Ищем модель 4.5 среди доступных
-                candidates = []
-                for m in models_list:
-                    m_id = m.get("id") if isinstance(m, dict) else str(m)
-                    if "4.5" in m_id.lower() or "v4.5" in m_id.lower():
-                        candidates.append(m_id)
-                    elif "v4" in m_id.lower() or "novelai" in m_id.lower():
-                        candidates.append(m_id)
-
-                if candidates:
-                    CACHED_NAISTERA_MODEL = candidates[0]
-                    return CACHED_NAISTERA_MODEL
-    except Exception as e:
-        print("Не удалось запросить список моделей Наистеры, используем дефолт:", e)
-
-    CACHED_NAISTERA_MODEL = fallback_model
-    return CACHED_NAISTERA_MODEL
-
-
 async def _call_naistera_worker(tags_prompt, aspect_ratio="portrait"):
     """
-    Выполняет генерацию арта через API Наистеры (NovelAI 4.5)
-    с поддержкой синхронного ответа, base64 и фоновой очереди (job polling).
+    Выполняет генерацию арта через официальный API Наистеры (как в SillyImages).
     """
-    model_name = await _get_naistera_v45_model()
     headers = {
         "Authorization": f"Bearer {NAISTERA_TOKEN}",
         "Content-Type": "application/json"
     }
 
-    # Очищаем теги от случайных спецсимволов
+    # Очищаем теги от мусора
     clean_tags = re.sub(r'[\r\n"«»`#]+', ' ', tags_prompt).strip()
     clean_tags = re.sub(r'\s{2,}', ' ', clean_tags)[:1200]
 
+    # Превращаем portrait/landscape в пропорции, понятные Наистере
+    aspect_map = {
+        "portrait": "2:3",
+        "landscape": "3:2",
+        "square": "1:1"
+    }
+    ratio_str = aspect_map.get(aspect_ratio, "2:3")
+
+    # Точное тело запроса под спецификацию Naistera API
     payload = {
         "prompt": clean_tags,
         "negative_prompt": NOVELAI_NEGATIVE_PROMPT,
-        "model": model_name,
-        "aspect_ratio": aspect_ratio,  # portrait (2:3), square (1:1), landscape (3:2)
+        "aspect_ratio": ratio_str,
+        "preset": "digital",
         "sync": True
     }
 
@@ -899,14 +869,14 @@ async def _call_naistera_worker(tags_prompt, aspect_ratio="portrait"):
         async with httpx.AsyncClient(timeout=100.0, follow_redirects=True) as client:
             resp = await client.post(f"{NAISTERA_BASE_URL}/api/generate", json=payload, headers=headers)
 
-            # 1. Прямой бинарный ответ с картинкой
+            # 1. Если пришла прямая картинка
             content_type = resp.headers.get("content-type", "").lower()
             if resp.status_code == 200 and content_type.startswith("image/"):
                 img_bytes = io.BytesIO(resp.content)
                 img_bytes.name = "katya_art.png"
                 return img_bytes, clean_tags, None
 
-            # 2. JSON-ответ (base64, URL или job_id)
+            # 2. JSON-ответ (ссылка, base64 или job_id)
             if resp.status_code == 200:
                 data = resp.json()
 
@@ -919,14 +889,14 @@ async def _call_naistera_worker(tags_prompt, aspect_ratio="portrait"):
                     return img_bytes, clean_tags, None
 
                 # Вариант прямой URL
-                img_url = data.get("url") or data.get("image_url")
+                img_url = data.get("url") or data.get("image_url") or data.get("result", {}).get("url")
                 if img_url:
                     img_resp = await client.get(img_url)
                     img_bytes = io.BytesIO(img_resp.content)
                     img_bytes.name = "katya_art.png"
                     return img_bytes, clean_tags, None
 
-                # Вариант очереди ожидания (polling)
+                # Вариант фоновой очереди (job polling)
                 job_id = data.get("job_id") or data.get("id")
                 if job_id:
                     for _ in range(40):  # Ждем до 80 секунд
@@ -934,8 +904,8 @@ async def _call_naistera_worker(tags_prompt, aspect_ratio="portrait"):
                         job_resp = await client.get(f"{NAISTERA_BASE_URL}/api/generate/jobs/{job_id}", headers=headers)
                         if job_resp.status_code == 200:
                             jdata = job_resp.json()
-                            status = jdata.get("status", "").lower()
-                            if status in ["completed", "done", "success"]:
+                            status = str(jdata.get("status", "")).lower()
+                            if status in ["completed", "done", "success", "finished"]:
                                 res_url = (jdata.get("result") or {}).get("url") or jdata.get("url")
                                 if res_url:
                                     img_get = await client.get(res_url)
@@ -943,12 +913,18 @@ async def _call_naistera_worker(tags_prompt, aspect_ratio="portrait"):
                                     img_bytes.name = "katya_art.png"
                                     return img_bytes, clean_tags, None
                             elif status in ["failed", "error"]:
-                                return None, clean_tags, "Генератор Наистеры не смог завершить картину."
+                                return None, clean_tags, "Генератор Наистеры сообщил об ошибке задачи."
 
             err_body = resp.text[:300] if resp.text else f"HTTP {resp.status_code}"
-            print("Ошибка ответа Наистеры:", resp.status_code, err_body)
-            if "limit" in err_body.lower() or "quota" in err_body.lower() or resp.status_code == 429:
-                return None, clean_tags, "Исчерпан лимит генераций по токену в боте Наистеры."
+            print(f"Ошибка ответа Наистеры [{resp.status_code}]:", err_body)
+            
+            if resp.status_code == 400:
+                return None, clean_tags, "Наистера отклонила запрос (Ошибка 400). Проверьте правильность тегов или лимиты токена."
+            if resp.status_code in [401, 403]:
+                return None, clean_tags, "Ошибка авторизации в Наистере. Проверьте токен."
+            if resp.status_code == 429:
+                return None, clean_tags, "Исчерпан лимит генераций по токену в Наистере."
+                
             return None, clean_tags, f"Художественная мастерская Наистеры ответила ошибкой ({resp.status_code})."
 
     except Exception as e:
