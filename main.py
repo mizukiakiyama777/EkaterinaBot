@@ -856,6 +856,10 @@ async def _call_naistera_worker(tags_prompt, aspect_ratio="portrait"):
 
     ratio_str = ART_ASPECT_RATIOS.get(aspect_ratio, ("2:3", ""))[0]
     encoded_prompt = urllib.parse.quote(clean_tags, safe="")
+    while len(encoded_prompt) > 6800 and "," in clean_tags:
+        clean_tags = clean_tags.rsplit(",", 1)[0].strip()
+        encoded_prompt = urllib.parse.quote(clean_tags, safe="")
+
     request_url = f"https://naistera.org/prompt/{encoded_prompt}?preset=digital&aspect_ratio={ratio_str}&token={NAISTERA_TOKEN}"
 
     try:
@@ -1160,40 +1164,72 @@ async def get_character_danbooru_tags(char):
 
 async def generate_novelai_prompt_from_photo(image, user_focus_text):
     """
-    По фото и задаче пользователя составляет сверхподробный промпт для NovelAI V4.5
-    с глубоким разбором текстур, материалов, складок, отделки, блеска и фурнитуры.
+    По фото и задаче пользователя составляет сверхподробный, многослойный промпт для NovelAI V4.5
+    с разбором посадки, формы рукавов, физики драпировки, каждой оборки, текстуры и фурнитуры.
     """
-    focus = (user_focus_text or "").strip() or "опиши максимально подробно наряд, все материалы, текстуры тканей, крой, складки, отделку, цвета и аксессуары"
+    focus = (user_focus_text or "").strip() or (
+        "опиши максимально подробно весь наряд, посадку по фигуре, форму рукавов, "
+        "каждую оборку и складку, как ткань лежит и струится, все текстуры и мелкие детали"
+    )
     prompt = f"""
-Ты — ведущий мастер-промптер для нейросети NovelAI Diffusion V4.5 (специалист по текстурам, материалам и деталям костюма).
-Пользователь прислал изображение и указал, ЧТО ИМЕННО нужно превратить в промпт:
+Ты — элитный художник по костюму, закройщик и мастер-промптер для NovelAI Diffusion V4.5.
+Пользователь прислал изображение и указал, ЧТО ИМЕННО нужно превратить в подробнейший промпт:
 "{focus}"
 
-ТВОЯ ЗАДАЧА:
-1. СТРОГИЕ ГРАНИЦЫ: Опиши ТОЛЬКО то, что попросил пользователь!
-   - Если он просит «только одежду/платье/мундир/украшения» — КАТЕГОРИЧЕСКИ НЕ добавляй пол, внешность, лицо, цвет глаз/волос, кожу, позу и фон.
-   - Если просит «всё целиком» или «наряд и позу» — подробно разбери каждый указанный аспект.
+СТРОГИЕ ГРАНИЦЫ:
+- Описывай ТОЛЬКО то, что попросил пользователь!
+- Если он просит описать «только платье / одежду / наряд / аксессуары» — КАТЕГОРИЧЕСКИ НЕ описывай лицо, глаза, волосы, кожу, пол, телосложение и фон!
+- Если он просит описать вместе с позой или фоном — так же подробно опиши и их.
 
-2. СВЕРХДЕТАЛИЗАЦИЯ (идеально понятная NovelAI V4.5 — смесь точных Danbooru-тегов и ёмких текстурных описателей через запятую, 50–100+ элементов):
-   - **Конструкция и крой:** точный фасон, форма выреза/воротника, посадка плеч, длина и форма рукавов (буфы, манжеты, воланы), линия талии, корсетная шнуровка/косточки, многослойность юбки/пол, разрезы, шлейф, асимметрия.
-   - **Ткани и их физическая текстура (ОБЯЗАТЕЛЬНО!):** опиши каждый слой материала и как он ощущается и ведёт себя на свету — например:
-     `heavy crushed velvet`, `lustrous glossy silk satin`, `semi-sheer delicate tulle`, `crisp pleated taffeta`, `intricate jacquard brocade weave`, `soft matte wool`, `fine linen texture`, `stiff structured bodice`, `flowing lightweight chiffon`, `soft natural fabric folds`, `deep draped creases`, `subtle iridescent sheen`.
-   - **Микро-отделка и декор:** узоры и плотность кружева (`delicate floral chantilly lace trim`, `scalloped lace edging`), вышивка (`raised gold bullion embroidery`, `silver filigree scrollwork`, `tiny pearl beading`), оборки/рюши/складки (`layered ruffled hem`, `knife pleats`, `gathered fabric`), канты, тесьма, кисти.
-   - **Фурнитура и аксессуары (если видны и подходят под запрос):** пуговицы (`polished brass buttons`, `mother-of-pearl buttons`), пряжки, броши, цепи, текстура кожи перчаток/сапог (`supple leather`, `matte suede`), металлы и камни (`tarnished antique gold`, `faceted dark ruby`, `lustrous pearls`).
-   - **Сложная цветовая палитра:** не пиши просто `red` или `blue` — уточняй сложные оттенки, полутона и переливы (`deep wine burgundy`, `warm ivory cream`, `muted dusty rose`, `champagne gold highlights`, `dark charcoal undertones`).
-   - **Акценты NovelAI:** ключевые текстуры и главные элементы образа можешь выделить фигурными скобками `{{...}}` (без фанатизма, на 3–5 главных деталей).
+КАК ИМЕННО ОПИСАТЬ ЗАПРОШЕННОЕ (НЕ СОКРАЩАЙ И НЕ ОБОБЩАЙ! Разбери по всем пунктам ниже, если они видны на запрошенном объекте):
 
-3. ТЕХНИЧЕСКИЕ ОГРАНИЧЕНИЯ:
-   - НЕ пиши теги качества (`masterpiece`, `best quality`), НЕ используй точки, глаголы-связки вроде `there is` и двойные кавычки внутри промпта.
-   - Всё строго на АНГЛИЙСКОМ ЯЗЫКЕ, через запятую.
+1. **ПОСАДКА И КОНСТРУКЦИЯ КРОЯ (Silhouette & Fit):**
+   - Как вещь сидит на теле: плотно облегает грудь и рёбра (`snug fitted bodice`, `structured boned corset waist`), утягивает талию, свободно ниспадает от линии груди (`empire waist`), сидит с напуском, завышенная/заниженная линия талии, рельефные вытачки и вертикальные швы (`princess seams`, `vertical boning channels`).
+   - Точная форма и глубина выреза/ворота (открытые плечи, каре, сердечко, глубокий V-вырез, высокая стойка, отложной воротничок, как ткань прилегает или отстаёт от ключиц).
 
-4. НАЗВАНИЕ: Придумай короткое, выразительное название для этого промпта НА РУССКОМ ЯЗЫКЕ (2–4 слова, например: «Алое бархатное платье», «Парадный золотой мундир»).
+2. **РУКАВА И ПЛЕЧЕВОЙ ПОЯС (Sleeves & Cuffs — ОСОБО ПОДРОБНО!):**
+   - Как пришит рукав (приспущенное плечо, высокий присборенный окат, реглан).
+   - Форма на всём протяжении: пышные буфы/фонарики на плече (`voluminous puffed shoulders`), перехваты лентами, облегающее предплечье (`fitted forearm`), расширяющийся колокол (`flared bell sleeves`), епископские рукава со складкой над запястьем (`draping bishop sleeves`), разрезы на рукавах (`slit sleeves`), многослойность манжет и как край рукава прикрывает кисть.
 
-Ответь СТРОГО чистым JSON без Markdown-обёрток:
-{{
-  "title": "Короткое название на русском",
-  "prompt": "detailed english prompt with rich textures and Danbooru tags separated by commas"
-}}
+3. **МНОГОСЛОЙНОСТЬ ЮБКИ, ПОДОЛА И ПОСАДКА НИЗА (Skirt & Layers):**
+   - Форма и объём: пышная на кринолине/турнюре (`bell-shaped crinoline silhouette`), А-силуэт, тяжёлые фалды, распашная верхняя юбка (`split overskirt revealing underlayer`), приподнятые подхваты (`draped swags`, `bustle folds`), шлейф.
+   - Взаимодействие слоёв: как верхний полупрозрачный слой ложится поверх нижнего плотного, как выглядывает нижняя юбка или подкладка, какой формы край подола (ровный, асимметричный, удлинённый сзади).
+
+4. **ФИЗИКА ТКАНИ, НАТЯЖЕНИЕ И СКЛАДКИ (Fabric Physics & Drapery — ОБЯЗАТЕЛЬНО!):**
+   - КАК именно ткань лежит и ведёт себя в пространстве:
+     * струится жидким водопадом (`fluid cascading drapery`, `liquid-like flowing fabric`),
+     * стоит жёсткой скульптурной формой (`crisp structured stiffness`, `sculpted rigid folds`),
+     * тяжело свисает под собственным весом (`heavy weighted vertical drape`),
+     * обволакивает изгибы (`clinging bias-cut drape`),
+     * собирается мелкими частыми заломами и складками натяжения (`fine tension creases`, `tightly gathered fabric folds at the waist`),
+     * мягко ложится и раскладывается волнами на поверхности (`softly pooling fabric at the hem`),
+     * воздушные летящие складки (`billowing airy pleats`).
+   - Направление складок: вертикальные каннелюры, диагональные драпировки, радиальная сборка от талии или броши.
+
+5. **КАЖДАЯ ОБОРКА, РЮШ, ВОЛАН И КРУЖЕВО (Ruffles, Flounces, Pleats):**
+   - Опиши расположение КАЖДОЙ оборки по отдельности (по кромке декольте, вокруг проймы, по краю манжет, ярусами по юбке, по самому низу подола).
+   - Укажи характер оборки: густая мелкая сборка (`densely gathered ruffle trim`), плоская мелкая плиссировка (`crisp knife pleats`), широкие мягкие волнистые воланы (`broad undulating tiered flounces`), каскадные жабо (`cascading jabot ruffles`), фестончатый кружевной край (`delicate scalloped eyelash lace edge`).
+
+6. **ТЕКСТУРА МАТЕРИАЛА И ИГРА СВЕТА (Texture & Light):**
+   - Конкретные материалы для каждой детали (бархат `plush crushed velvet`, глянцевый тяжёлый атлас `high-sheen lustrous heavy silk satin`, хрустящая тафта `crisp iridescent taffeta`, воздушный шифон `weightless translucent chiffon`, сетчатый тюль `fine sheer tulle mesh`, плотный узорчатый жаккард/парча `embossed jacquard brocade weave`, тонкий батист, мягкий кашемир, выделанная кожа).
+   - Как свет падает на материал: острые блики на гребнях складок (`sharp specular highlights along fold ridges`), глубокие бархатистые тени в глубине фалд (`deep velvety shadows inside fold crevices`), лёгкое просвечивание тонкого слоя (`semi-translucent fabric showing soft silhouette beneath`).
+
+7. **ВЫШИВКА, ОРНАМЕНТ И ФУРНИТУРА (Ornament & Hardware):**
+   - Узор кружева и вышивки (растительные завитки, цветочная гладь, барочный дамаск, рельефная золотая канитель `raised metallic gold bullion embroidery`, серебряная скань, россыпь мелкого бисера и жемчуга `micro-pearl beading along seams`).
+   - Все застёжки и мелкие элементы: ряд мелких обтянутых тканью/жемчужных/латунных пуговиц (`row of tiny pearl buttons`), перекрестная шнуровка через люверсы (`laced corset back/front with satin cord`), атласные ленты и завязки с бантами и длинными свисающими концами (`trailing satin ribbon ties`), пряжки, броши, канты (`contrast piping along seams`), кисточки.
+
+8. **СЛОЖНЫЕ ОТТЕНКИ (Color Palette):**
+   - Точные многослойные оттенки, переливы на свету и в тени, контраст подкладки, нитей и отделки.
+
+ФОРМАТ ПРАВИЛ ДЛЯ NOVELAI V4.5:
+- Пиши промпт СТРОГО НА АНГЛИЙСКОМ ЯЗЫКЕ, через запятую.
+- Это должен быть ОЧЕНЬ БОГАТЫЙ, РАЗВЁРНУТЫЙ список из 80–150 точных Danbooru-тегов и ёмких текстурно-конструктивных описателей (примерно 1000–2400 символов).
+- НЕ пиши теги качества (`masterpiece`, `best quality`), НЕ используй предложения с точками, глаголы-связки вроде `there is / it has` и двойные кавычки.
+- Ключевые текстурные/конструктивные акценты (3–6 главных деталей) можешь слегка усилить фигурными скобками `{{...}}`.
+
+ФОРМАТ ТВОЕГО ОТВЕТА — СТРОГО 2 СТРОКИ БЕЗ ЛИШНИХ СЛОВ И MARKDOWN:
+TITLE: Короткое красивое название на русском (2–4 слова)
+PROMPT: ultra-detailed english prompt separated by commas
 """
     raw, err = await generate_gemini_text_safe([prompt, image], model_name=MODEL_LITE)
     if err or not raw:
@@ -1201,22 +1237,36 @@ async def generate_novelai_prompt_from_photo(image, user_focus_text):
     if err or not raw:
         return None, None, err or "Не удалось составить промпт по изображению."
 
+    clean_raw = re.sub(r'```[a-zA-Z]*\s*', '', raw).replace('```', '').strip()
+
+    # Основной надёжный парсинг: TITLE: ... / PROMPT: ...
+    m_title = re.search(r'(?im)^\s*TITLE\s*:\s*(.+)$', clean_raw)
+    m_prompt = re.search(r'(?ims)^\s*PROMPT\s*:\s*(.+)$', clean_raw)
+    if m_prompt:
+        title = (m_title.group(1).strip() if m_title else "Детальный промпт по фото")[:60]
+        nai_prompt = m_prompt.group(1).strip()
+        nai_prompt = re.sub(r'[\n\r"«»`/?#]+', ' ', nai_prompt)
+        nai_prompt = re.sub(r'\s{2,}', ' ', nai_prompt).strip(" ,")
+        if nai_prompt:
+            return title, nai_prompt, None
+
+    # Запасной парсинг, если модель всё же ответила JSON
     try:
-        clean_raw = re.sub(r'```json\s*', '', raw)
-        clean_raw = re.sub(r'```\s*', '', clean_raw).strip()
         m = re.search(r'\{[\s\S]*\}', clean_raw)
         if m:
             data = json.loads(m.group(0))
-            title = str(data.get("title") or "Новый промпт по фото").strip()[:60]
+            title = str(data.get("title") or "Детальный промпт по фото").strip()[:60]
             nai_prompt = str(data.get("prompt") or "").strip()
-            nai_prompt = re.sub(r'[\n\r"«»`/?#]+', ' ', nai_prompt).strip(" ,")
+            nai_prompt = re.sub(r'[\n\r"«»`/?#]+', ' ', nai_prompt)
+            nai_prompt = re.sub(r'\s{2,}', ' ', nai_prompt).strip(" ,")
             if nai_prompt:
                 return title, nai_prompt, None
     except Exception as e:
         print("Ошибка парсинга фото-промпта:", e)
 
-    fallback_prompt = re.sub(r'[\n\r"«»`/?#]+', ' ', raw).strip(" ,")
-    return "Промпт по фото", fallback_prompt, None
+    fallback_prompt = re.sub(r'[\n\r"«»`/?#]+', ' ', clean_raw)
+    fallback_prompt = re.sub(r'\s{2,}', ' ', fallback_prompt).strip(" ,")
+    return "Детальный промпт по фото", fallback_prompt, None
 
 async def build_art_prompt_with_ai(user_request, active_char=None, chat_id=None):
     """
